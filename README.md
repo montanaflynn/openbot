@@ -1,6 +1,6 @@
 # openbot
 
-An autonomous AI agent that runs in a loop, powered by OpenAI's [Codex](https://github.com/openai/codex) runtime. Give it a task, and it will work through it iteratively -- executing commands, reading files, writing code -- sleeping between iterations but waking instantly when you type new input.
+An autonomous AI agent that runs in a loop, powered by OpenAI's [Codex](https://github.com/openai/codex) runtime. Create named bots with their own instructions, skills, and memory -- then run them on any project.
 
 ## Prerequisites
 
@@ -24,14 +24,17 @@ cargo install --path .
 ## Quick start
 
 ```sh
-# Run a one-shot task
-openbot run --prompt "Find and fix any TODO comments in this project" -n 1
+# Create a bot
+openbot bots create secbot --description "Security auditor" --prompt "Audit this codebase for security issues"
 
-# Run a multi-step task with 5 iterations
-openbot run --prompt "Add unit tests for the utils module" -n 5
+# Run it
+openbot run secbot
+
+# Run with overrides
+openbot run secbot -n 5 --model o4-mini
 
 # Run outside a git repo
-openbot run --prompt "Organize these files" --skip-git-check
+openbot run secbot --skip-git-check
 ```
 
 ## Usage
@@ -40,92 +43,120 @@ openbot run --prompt "Organize these files" --skip-git-check
 openbot <COMMAND>
 
 Commands:
-  run      Run the agent loop
-  skills   List available skills
-  memory   Manage persistent memory
+  run      Run a bot
+  bots     Manage bots
+  skills   List skills for a bot
+  memory   Manage a bot's memory
   help     Print help
 ```
 
-### `openbot run`
+### `openbot run <bot>`
 
-Start the agent loop. The agent runs your prompt, sleeps, then runs again -- accumulating memory across iterations.
+Start the agent loop for a named bot. The agent runs the bot's instructions, sleeps, then runs again -- accumulating memory across iterations.
 
 ```
-openbot run [OPTIONS]
+openbot run <BOT> [OPTIONS]
 
 Options:
-  -p, --prompt <PROMPT>        Instructions for the agent
+  -p, --prompt <PROMPT>        Override the bot's instructions
   -n, --max-iterations <N>     Max iterations, 0 for unlimited [default: 10]
   -m, --model <MODEL>          Model to use (e.g. o4-mini, gpt-4.1)
   -s, --sleep <SECONDS>        Sleep between iterations (overrides config)
       --skip-git-check         Allow running outside git repos
+      --resume <SESSION_ID>    Resume a previous session
 ```
 
 During the sleep window, type anything into stdin to wake the agent immediately and inject that text into its memory for the next iteration.
 
-### `openbot skills`
+When interrupted with ctrl-c, the agent shuts down gracefully and prints a resume command you can use to continue where you left off.
 
-List all loaded skills and where they came from.
+### `openbot bots`
 
-```
-$ openbot skills
-Available skills (1):
-
-  code-review - Review code for bugs and style issues
-    source: skills/code-review.md
-```
-
-### `openbot memory`
-
-Inspect and manage the persistent key-value store and iteration history.
+Manage named bots.
 
 ```sh
-openbot memory show              # Display all entries and history
-openbot memory set <KEY> <VALUE> # Store a key-value pair
-openbot memory remove <KEY>      # Remove a key
-openbot memory clear             # Wipe all memory
+openbot bots list                                    # List all bots
+openbot bots create mybot                            # Create with defaults
+openbot bots create mybot --prompt "Do X and Y"     # Create with custom instructions
+openbot bots create mybot -d "My helper" -p "..."   # Create with description + instructions
+openbot bots show mybot                              # Show config, skills, memory stats
 ```
 
-## Configuration
+### `openbot skills <bot>`
 
-Drop an `openbot.toml` in your working directory. All fields are optional -- anything omitted uses the default.
+List all loaded skills for a bot (global + bot-local).
 
-```toml
-# Base instructions sent to the agent every iteration
-instructions = "You are an autonomous AI agent."
+```
+$ openbot skills secbot
+Skills for 'secbot' (1):
 
-# Max iterations per run (0 = unlimited)
-max_iterations = 10
+  code-review - Review code for bugs and style issues
+    source: /Users/you/.openbot/skills/code-review.md
+```
 
-# Seconds to sleep between iterations (0 = only run on input)
-sleep_secs = 30
+### `openbot memory <bot>`
 
-# When the agent says this phrase, the loop stops
-stop_phrase = "TASK COMPLETE"
+Inspect and manage a bot's persistent memory.
 
-# Model override (omit to use the codex default)
-# model = "o4-mini"
+```sh
+openbot memory mybot show              # Display all entries and history
+openbot memory mybot set <KEY> <VALUE> # Store a key-value pair
+openbot memory mybot remove <KEY>      # Remove a key
+openbot memory mybot clear             # Wipe all memory
+```
 
-# Sandbox mode: "read-only" | "workspace-write" | "danger-full-access"
+## Directory structure
+
+All data lives under `~/.openbot/`:
+
+```
+~/.openbot/
+├── skills/                    # Global skills (shared by all bots)
+│   └── code-review.md
+└── bots/
+    └── secbot/
+        ├── config.md          # Bot config (TOML frontmatter + markdown instructions)
+        ├── skills/            # Bot-local skills
+        │   └── custom.md
+        └── memory.json        # Persistent memory
+```
+
+- **Global skills** (`~/.openbot/skills/`) are available to every bot.
+- **Bot-local skills** (`~/.openbot/bots/<name>/skills/`) are only available to that bot.
+- Bots can create their own skills at runtime -- they're picked up on the next iteration.
+
+## Bot configuration
+
+Each bot has a `config.md` — a markdown file with TOML frontmatter. The frontmatter holds settings, and the markdown body is the bot's instructions.
+
+```markdown
++++
+description = "Security auditor for OWASP top 10"
+max_iterations = 5
+sleep_secs = 10
 sandbox = "workspace-write"
++++
 
-# Where to persist memory between runs
-memory_path = ".openbot/memory.json"
-
-# Directories to scan for skill files
-skill_dirs = ["skills", "~/.codex/skills"]
-
-# Allow running outside git repositories
-skip_git_check = false
+You are a security auditor. Scan this codebase for vulnerabilities...
 ```
 
-CLI flags override config file values. For example, `--prompt` overrides `instructions`, and `-n` overrides `max_iterations`.
+All frontmatter fields are optional:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `description` | (empty) | Short description shown in `bots list` |
+| `max_iterations` | `10` | Max iterations per run, `0` = unlimited |
+| `sleep_secs` | `30` | Seconds between iterations, `0` = no sleep |
+| `stop_phrase` | `"TASK COMPLETE"` | Phrase that ends the loop |
+| `model` | (codex default) | Model override (e.g. `o4-mini`) |
+| `sandbox` | `"workspace-write"` | `read-only`, `workspace-write`, or `danger-full-access` |
+| `skip_git_check` | `false` | Allow running outside git repos |
+
+CLI flags override config values. See `examples/config.md` for a full example.
 
 ## Skills
 
-Skills are markdown files that get injected into the agent's prompt, giving it specialized knowledge or procedures. Place `.md` files in any directory listed in `skill_dirs`.
-
-A skill file looks like this:
+Skills are markdown files that get injected into the agent's prompt, giving it specialized knowledge or procedures.
 
 ```markdown
 ---
@@ -140,31 +171,31 @@ When asked to review code, follow these steps:
 
 The YAML frontmatter (`name`, `description`) is optional. Without it, the filename is used as the skill name.
 
-Skills are compatible with Codex's native `~/.codex/skills/` directory, so any skills you already have there will be picked up automatically if you include that path in `skill_dirs`.
+Place skills in `~/.openbot/skills/` for global availability, or in `~/.openbot/bots/<name>/skills/` for a specific bot. See `examples/skills/` for sample skill files.
 
 ## Memory
 
-openbot maintains a JSON file (default `.openbot/memory.json`) that persists across runs. It contains:
+Each bot maintains a `memory.json` that persists across runs. It contains:
 
-- **Entries** -- a key-value store you can read/write from the CLI or that the agent loop populates
+- **Entries** -- a key-value store you can read/write from the CLI or that the agent populates
 - **History** -- a record of each iteration (timestamp, prompt summary, response summary)
 
-Memory is injected into the agent's prompt each iteration, so the agent is aware of what happened in previous iterations. The last 5 history entries are included to keep the context window manageable.
+Memory is injected into the agent's prompt each iteration, so the agent is aware of what happened previously. The last 5 history entries are included to keep the context window manageable.
 
 ```sh
 # Seed the agent with context before running
-openbot memory set project_goal "migrate the database to PostgreSQL"
-openbot memory set constraints "must maintain backward compatibility"
+openbot memory secbot set project_goal "migrate the database to PostgreSQL"
+openbot memory secbot set constraints "must maintain backward compatibility"
 
 # Then run -- the agent sees these entries in its prompt
-openbot run --prompt "Work on the project goal described in memory"
+openbot run secbot
 ```
 
 ## How it works
 
 ```
                   ┌─────────────────────────┐
-                  │      openbot run        │
+                  │    openbot run <bot>     │
                   └────────────┬────────────┘
                                │
                   ┌────────────▼────────────┐
@@ -203,8 +234,8 @@ Under the hood, openbot uses `codex-core` directly -- the same Rust library that
 Set `RUST_LOG` to see what's happening:
 
 ```sh
-RUST_LOG=info openbot run --prompt "hello" -n 1
-RUST_LOG=debug openbot run --prompt "hello" -n 1
+RUST_LOG=info openbot run secbot -n 1
+RUST_LOG=debug openbot run secbot -n 1
 ```
 
 ## Reference Documentation
@@ -212,7 +243,7 @@ RUST_LOG=debug openbot run --prompt "hello" -n 1
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - runtime architecture and data flow
 - [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md) - complete config key reference
 - [`docs/MEMORY_FORMAT.md`](docs/MEMORY_FORMAT.md) - persisted memory schema and semantics
-- [`docs/SKILLS_REFERENCE.md`](docs/SKILLS_REFERENCE.md) - built-in skill behavior and loading rules
+- [`docs/SKILLS_REFERENCE.md`](docs/SKILLS_REFERENCE.md) - skill loading rules and examples
 
 ## License
 
