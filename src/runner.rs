@@ -1,8 +1,3 @@
-//! Core execution loop for OpenBot.
-//!
-//! This module wires configuration, Codex session management, prompt assembly,
-//! streaming event handling, memory persistence, and iteration control.
-
 use anyhow::{Context, Result};
 use codex_core::config::{ConfigBuilder, ConfigOverrides, find_codex_home};
 use codex_core::{AuthManager, ThreadManager};
@@ -12,6 +7,7 @@ use codex_protocol::user_input::UserInput;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::watch;
 use tracing::{error, warn};
 
 use crate::config::OpenBotConfig;
@@ -19,16 +15,8 @@ use crate::memory::MemoryStore;
 use crate::prompt::build_prompt;
 use crate::skills::load_skills;
 
-/// Run the main agent loop.
-///
-/// Steps performed:
-/// 1. Load skills and memory
-/// 2. Build Codex runtime configuration and start a session
-/// 3. Repeatedly build prompts and submit user turns
-/// 4. Stream events, persist summaries, and stop on completion signals
-pub async fn run(config: OpenBotConfig) -> Result<()> {
-    // Load all configured skills. Failures are downgraded to warnings so the
-    // main run can still proceed.
+/// Run the main agent loop, optionally resuming a previous session.
+pub async fn run(config: OpenBotConfig, resume_session: Option<String>) -> Result<()> {
     let skill_dirs = config.resolved_skill_dirs();
     let skills = load_skills(&skill_dirs).unwrap_or_else(|e| {
         warn!("failed to load skills: {e}");
@@ -42,7 +30,6 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
         }
     }
 
-    // Load persisted memory (or initialize empty state).
     let mut memory = MemoryStore::load(&config.memory_path).with_context(|| "loading memory")?;
     eprintln!(
         "Memory: {} entries, {} history records",
@@ -50,19 +37,14 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
         memory.memory.history.len()
     );
 
-    // Resolve Codex home early so startup errors are immediate and explicit.
     let _codex_home = find_codex_home().with_context(|| "finding codex home")?;
 
     let sandbox_mode = config.sandbox_mode();
-
-    // Approval policy is currently fixed to `Never` in all sandbox modes.
-    // Keeping the match makes future policy differentiation straightforward.
     let approval_policy = match sandbox_mode {
         SandboxMode::DangerFullAccess => Some(AskForApproval::Never),
         _ => Some(AskForApproval::Never),
     };
 
-    // Build harness overrides to inject runtime-level settings.
     let overrides = ConfigOverrides {
         model: config.model.clone(),
         review_model: None,
@@ -86,14 +68,12 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
         additional_writable_roots: Vec::new(),
     };
 
-    // Construct final Codex runtime configuration.
     let codex_config = ConfigBuilder::default()
         .harness_overrides(overrides)
         .build()
         .await
         .with_context(|| "building codex config")?;
 
-    // Enforce git repository requirement unless explicitly disabled.
     if !config.skip_git_check {
         let cwd = codex_config.cwd.to_path_buf();
         if codex_core::git_info::get_git_repo_root(&cwd).is_none() {
@@ -101,7 +81,6 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
         }
     }
 
-    // Create shared auth and thread managers used to run Codex sessions.
     let auth_manager = AuthManager::shared(
         codex_config.codex_home.clone(),
         true,
@@ -115,26 +94,66 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
         codex_config.model_catalog.clone(),
     ));
 
-    // Start a new thread/session.
+    // Start or resume a session.
     let codex_core::NewThread {
         thread_id: _,
         thread,
         session_configured,
-    } = thread_manager
-        .start_thread(codex_config.clone())
-        .await
-        .with_context(|| "starting codex thread")?;
+    } = if let Some(ref session_id) = resume_session {
+        // Try to find and resume the previous session by ID.
+        let rollout_path =
+            codex_core::find_thread_path_by_id_str(&codex_config.codex_home, session_id)
+                .await
+                .with_context(|| format!("looking up session {session_id}"))?;
+        match rollout_path {
+            Some(path) => {
+                eprintln!("Resuming session {session_id}...");
+                thread_manager
+                    .resume_thread_from_rollout(
+                        codex_config.clone(),
+                        path,
+                        auth_manager.clone(),
+                    )
+                    .await
+                    .with_context(|| "resuming session")?
+            }
+            None => {
+                eprintln!("Session {session_id} not found, starting new session.");
+                thread_manager
+                    .start_thread(codex_config.clone())
+                    .await
+                    .with_context(|| "starting codex thread")?
+            }
+        }
+    } else {
+        thread_manager
+            .start_thread(codex_config.clone())
+            .await
+            .with_context(|| "starting codex thread")?
+    };
 
-    eprintln!("Session started (model: {})", &session_configured.model);
+    let session_id = session_configured.session_id.to_string();
+    eprintln!("Session {} (model: {})", &session_id, &session_configured.model);
 
-    // Cache immutable defaults reused for each submitted turn.
+    // Set up ctrl-c handler for graceful shutdown.
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let thread_for_ctrlc = thread.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\nInterrupted, shutting down gracefully...");
+            // Signal the main loop to stop.
+            shutdown_tx.send(true).ok();
+            // Tell codex to abort any in-flight work.
+            thread_for_ctrlc.submit(Op::Interrupt).await.ok();
+        }
+    });
+
     let default_cwd = codex_config.cwd.to_path_buf();
     let default_approval_policy = codex_config.permissions.approval_policy.value();
     let default_sandbox_policy = codex_config.permissions.sandbox_policy.get();
     let default_effort = codex_config.model_reasoning_effort;
     let default_summary = codex_config.model_reasoning_summary;
 
-    // Resolve model once so repeated turns do not re-fetch default selection.
     let default_model = {
         use codex_core::models_manager::manager::RefreshStrategy;
         thread_manager
@@ -150,18 +169,21 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
         .unwrap_or_else(|| "TASK COMPLETE".into());
     let sleep_duration = Duration::from_secs(config.sleep_secs);
 
-    // Set up stdin reader used to interrupt sleep and inject ad-hoc user input.
     let stdin = tokio::io::stdin();
     let mut stdin_reader = BufReader::new(stdin).lines();
 
-    // `0` means unlimited iterations. Internally represent that with `u32::MAX`.
     let iteration_limit = if max_iterations == 0 {
         u32::MAX
     } else {
         max_iterations
     };
 
-    for iteration in 1..=iteration_limit {
+    'outer: for iteration in 1..=iteration_limit {
+        // Check if ctrl-c was pressed before starting a new iteration.
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
         eprintln!(
             "\n--- Iteration {}/{} ---",
             iteration,
@@ -172,7 +194,6 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
             }
         );
 
-        // Build fresh prompt for this iteration using latest memory state.
         let prompt = build_prompt(
             &config.instructions,
             &skills,
@@ -181,7 +202,6 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
             max_iterations,
         );
 
-        // Submit prompt as a user turn to the active thread.
         let items = vec![UserInput::Text {
             text: prompt.clone(),
             text_elements: Vec::new(),
@@ -203,7 +223,6 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
             .await
             .with_context(|| "submitting user turn")?;
 
-        // Stream events until turn completion.
         let mut last_message = String::new();
 
         loop {
@@ -214,14 +233,12 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
 
             match &event.msg {
                 EventMsg::AgentMessage(msg) => {
-                    // Full message snapshots can appear independently of deltas.
                     if !msg.message.is_empty() {
                         println!("{}", msg.message);
                         last_message = msg.message.clone();
                     }
                 }
                 EventMsg::AgentMessageDelta(delta) => {
-                    // Stream incremental output as it arrives.
                     if !delta.delta.is_empty() {
                         print!("{}", delta.delta);
                         last_message.push_str(&delta.delta);
@@ -238,12 +255,15 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
                 EventMsg::TurnComplete(_) => {
                     break;
                 }
+                EventMsg::TurnAborted(_) => {
+                    // Turn was interrupted (e.g. by ctrl-c).
+                    break;
+                }
                 EventMsg::Error(e) => {
                     error!("Error from codex: {:?}", e);
                     break;
                 }
                 EventMsg::ExecApprovalRequest(req) => {
-                    // Auto-approve command requests in this autonomous run mode.
                     let id = req.approval_id.clone().unwrap_or_default();
                     thread
                         .submit(Op::ExecApproval {
@@ -258,24 +278,26 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
             }
         }
 
-        // Persist compact summaries from this completed iteration.
+        // Save iteration results.
         let prompt_summary = truncate_string(&config.instructions, 100);
         let response_summary = truncate_string(&last_message, 500);
         memory.add_iteration(iteration, &prompt_summary, &response_summary);
         memory.save().with_context(|| "saving memory")?;
 
-        // Stop early when the configured completion phrase appears.
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
         if last_message.contains(&stop_phrase) {
             eprintln!("\nAgent signaled completion: \"{stop_phrase}\"");
             break;
         }
 
-        // Skip sleep handling after the final planned iteration.
         if iteration >= iteration_limit {
             break;
         }
 
-        // Sleep between iterations, but allow input to wake and influence next turn.
+        // Sleep between iterations, but wake on user input or ctrl-c.
         if config.sleep_secs > 0 {
             eprintln!(
                 "Sleeping {} seconds (type to wake and inject input)...",
@@ -283,42 +305,41 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
             );
 
             tokio::select! {
-                _ = tokio::time::sleep(sleep_duration) => {
-                    // Normal wake after timeout.
-                }
+                _ = tokio::time::sleep(sleep_duration) => {}
                 line = stdin_reader.next_line() => {
                     match line {
                         Ok(Some(input)) if !input.trim().is_empty() => {
                             eprintln!("User input received, injecting into next iteration.");
-                            // Store transient user input so the next prompt can consume it.
                             memory.set("user_input".into(), input);
                             memory.save().ok();
                         }
                         Ok(None) => {
-                            // End-of-file on stdin; continue unattended.
                             eprintln!("stdin closed, continuing.");
                         }
                         _ => {}
                     }
                 }
+                _ = shutdown_rx.changed() => {
+                    break 'outer;
+                }
             }
         }
     }
 
-    // Print summary of the run.
+    // Print summary.
     let total = memory.memory.history.len();
     eprintln!("\n--- Summary ---");
     eprintln!("Completed {} iteration(s)", total);
     if let Some(last) = memory.memory.history.last() {
-        eprintln!("Last response: {}", truncate_string(&last.response_summary, 200));
+        eprintln!(
+            "Last response: {}",
+            truncate_string(&last.response_summary, 200)
+        );
     }
 
-    // Request orderly shutdown with a timeout so we never hang.
-    eprintln!("Shutting down...");
+    // Shut down codex with a timeout.
     thread.submit(Op::Shutdown).await.ok();
-
-    let shutdown_timeout = Duration::from_secs(5);
-    let _ = tokio::time::timeout(shutdown_timeout, async {
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match thread.next_event().await {
                 Ok(event) if matches!(event.msg, EventMsg::ShutdownComplete) => break,
@@ -329,10 +350,12 @@ pub async fn run(config: OpenBotConfig) -> Result<()> {
     })
     .await;
 
+    // Always print resume hint so the user can pick up where they left off.
+    eprintln!("\nTo resume this session:\n  openbot run --resume {session_id}");
+
     Ok(())
 }
 
-/// Truncate to at most `max` bytes, appending `...` when truncated.
 fn truncate_string(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()

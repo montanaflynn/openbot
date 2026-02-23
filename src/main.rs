@@ -1,3 +1,8 @@
+//! CLI entry point for OpenBot.
+//!
+//! This module is intentionally thin: it parses command-line arguments, loads
+//! configuration, and delegates behavior to feature modules.
+
 mod config;
 mod memory;
 mod prompt;
@@ -7,13 +12,16 @@ mod skills;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+/// Top-level CLI parser.
 #[derive(Parser)]
 #[command(name = "openbot", about = "AI agent loop powered by codex-core")]
 struct Cli {
+    /// Selected subcommand.
     #[command(subcommand)]
     command: Commands,
 }
 
+/// Supported CLI subcommands.
 #[derive(Subcommand)]
 enum Commands {
     /// Run the agent loop
@@ -37,6 +45,10 @@ enum Commands {
         /// Seconds to sleep between iterations (overrides config)
         #[arg(short, long)]
         sleep: Option<u64>,
+
+        /// Resume a previous session by ID
+        #[arg(long)]
+        resume: Option<String>,
     },
 
     /// List available skills
@@ -44,11 +56,13 @@ enum Commands {
 
     /// Manage persistent memory
     Memory {
+        /// Memory management operation.
         #[command(subcommand)]
         action: MemoryAction,
     },
 }
 
+/// Actions for the `memory` management subcommand.
 #[derive(Subcommand)]
 enum MemoryAction {
     /// Show all memory entries and history
@@ -69,9 +83,11 @@ enum MemoryAction {
     Clear,
 }
 
+/// Program entrypoint.
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
+    // Initialize structured logging/tracing. We default to `error` level unless
+    // overridden via tracing environment variables.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -83,6 +99,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir()?;
 
+    // Route execution to the selected command.
     match cli.command {
         Commands::Run {
             prompt,
@@ -90,14 +107,21 @@ async fn main() -> Result<()> {
             model,
             skip_git_check,
             sleep,
+            resume,
         } => {
-            let config = config::OpenBotConfig::load(&cwd)?
-                .with_overrides(prompt, Some(max_iterations), model, skip_git_check, sleep);
+            let config = config::OpenBotConfig::load(&cwd)?.with_overrides(
+                prompt,
+                Some(max_iterations),
+                model,
+                skip_git_check,
+                sleep,
+            );
 
-            runner::run(config).await?;
+            runner::run(config, resume).await?;
         }
 
         Commands::Skills => {
+            // Resolve configured skill directories and print discovered skills.
             let config = config::OpenBotConfig::load(&cwd)?;
             let skill_dirs = config.resolved_skill_dirs();
             let skills = skills::load_skills(&skill_dirs)?;
@@ -118,6 +142,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Memory { action } => {
+            // Load memory store and perform the requested management action.
             let config = config::OpenBotConfig::load(&cwd)?;
             let mut store = memory::MemoryStore::load(&config.memory_path)?;
 
