@@ -29,10 +29,8 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Faster release builds: more parallel codegen, skip LTO.
-# Still plenty fast at runtime -- the bottleneck is the network, not CPU.
+# Skip LTO to keep release builds from taking forever.
 [profile.release]
-codegen-units = 16
 lto = false
 
 # Keep websocket crates aligned with the Codex workspace to avoid runtime

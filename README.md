@@ -12,14 +12,13 @@ An autonomous AI agent that runs in a loop, powered by OpenAI's [Codex](https://
 ```sh
 git clone https://github.com/montanaflynn/openbot
 cd openbot
-cargo install --path .
-```
 
-The first build takes a few minutes since codex-core has a large dependency tree. For a faster debug build during development:
-
-```sh
+# Local development (fast)
 cargo build
 ./target/debug/openbot --help
+
+# Release install
+cargo install --path .
 ```
 
 ## Quick start
