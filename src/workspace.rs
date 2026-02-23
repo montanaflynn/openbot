@@ -47,6 +47,10 @@ impl WorkspaceRegistry {
 
     /// Register (or update) a workspace for the given canonical path.
     /// Returns the slug for this workspace.
+    ///
+    /// If a slug collision occurs with a path that no longer exists on disk,
+    /// the stale entry is evicted so the new path inherits the slug (and its
+    /// memory directory). This keeps things portable across machines.
     pub fn register(&mut self, canonical_path: &str) -> String {
         let now = Utc::now();
         if let Some(entry) = self.workspaces.get_mut(canonical_path) {
@@ -55,6 +59,11 @@ impl WorkspaceRegistry {
         }
 
         let base_slug = slug_from_path(canonical_path);
+
+        // If the slug is taken by a path that no longer exists, evict it so
+        // we inherit the slug (and its memory directory).
+        self.evict_stale_for_slug(&base_slug);
+
         let slug = self.unique_slug(&base_slug);
 
         self.workspaces.insert(
@@ -74,6 +83,21 @@ impl WorkspaceRegistry {
         self.workspaces
             .iter()
             .find(|(_, entry)| entry.slug == slug)
+    }
+
+    /// Remove entries whose path no longer exists on disk if they hold the
+    /// given slug. This lets a new path inherit the slug (and its memory)
+    /// when the original path is gone (e.g. different machine, moved dir).
+    fn evict_stale_for_slug(&mut self, slug: &str) {
+        let stale_keys: Vec<String> = self
+            .workspaces
+            .iter()
+            .filter(|(path, entry)| entry.slug == slug && !Path::new(path.as_str()).exists())
+            .map(|(path, _)| path.clone())
+            .collect();
+        for key in stale_keys {
+            self.workspaces.remove(&key);
+        }
     }
 
     /// Ensure the slug is unique across existing workspaces.
@@ -165,10 +189,37 @@ mod tests {
 
     #[test]
     fn register_handles_collision() {
+        // Both paths are nonexistent so the first gets evicted — but to test
+        // a genuine collision we need both paths to "exist". We can't easily
+        // fake that, so we test unique_slug directly.
         let mut reg = WorkspaceRegistry::default();
-        let slug1 = reg.register("/home/alice/myapp");
-        let slug2 = reg.register("/home/bob/myapp");
-        assert_ne!(slug1, slug2);
-        assert!(slug2.starts_with("myapp"));
+        // Manually insert so eviction doesn't remove it (eviction only runs
+        // during register, and unique_slug is called after eviction).
+        let now = chrono::Utc::now();
+        reg.workspaces.insert(
+            "/tmp/this-path-exists-for-test/myapp".into(),
+            WorkspaceEntry {
+                slug: "myapp".into(),
+                first_seen: now,
+                last_used: now,
+            },
+        );
+        let slug2 = reg.unique_slug("myapp");
+        assert_eq!(slug2, "myapp-2");
+    }
+
+    #[test]
+    fn register_evicts_stale_path() {
+        let mut reg = WorkspaceRegistry::default();
+        // Register a path that doesn't exist on disk.
+        let slug1 = reg.register("/nonexistent/old-machine/myapp");
+        assert_eq!(slug1, "myapp");
+
+        // Register a new (also nonexistent) path with the same dir name.
+        // The old entry should be evicted so the new one gets the same slug.
+        let slug2 = reg.register("/different/path/myapp");
+        assert_eq!(slug2, "myapp");
+        assert_eq!(reg.workspaces.len(), 1);
+        assert!(reg.workspaces.contains_key("/different/path/myapp"));
     }
 }
