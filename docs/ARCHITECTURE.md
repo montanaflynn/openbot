@@ -22,7 +22,11 @@ This document explains the runtime architecture of `openbot` and how modules int
     └── <name>/
         ├── config.md          # Bot config (TOML frontmatter + markdown body)
         ├── skills/            # Bot-local skills
-        └── memory.json        # Persistent memory
+        ├── memory.json        # Global memory (fallback)
+        ├── workspaces.json    # Workspace registry
+        └── workspaces/        # Per-project memory
+            └── <slug>/
+                └── memory.json
 ```
 
 ## Module Map
@@ -37,6 +41,12 @@ This document explains the runtime architecture of `openbot` and how modules int
   - Applies CLI overrides.
   - Resolves sandbox mode and skill directories (global + bot-local).
 
+- `src/git.rs`
+  - Git worktree lifecycle: create, remove, resolve repo root.
+  - `create_worktree()` creates an isolated checkout on branch `openbot/<bot>-<ts>`.
+  - `WorktreeGuard` (Drop-based) ensures cleanup on any exit path.
+  - `resolve_repo_root()` uses `git rev-parse --show-toplevel` so worktrees of the same repo share one root.
+
 - `src/skills.rs`
   - Loads `.md` skill files from configured directories.
   - Parses optional frontmatter (`name`, `description`).
@@ -44,25 +54,30 @@ This document explains the runtime architecture of `openbot` and how modules int
 
 - `src/memory.rs`
   - Defines persistent memory model (`entries`, `history`).
-  - Handles JSON load/save at `~/.openbot/bots/<name>/memory.json`.
+  - Handles JSON load/save (per-workspace at `~/.openbot/bots/<name>/workspaces/<slug>/memory.json`).
   - Provides CLI-friendly rendering for `openbot memory <bot> show`.
 
 - `src/prompt.rs`
   - Assembles iteration prompt from instructions, skills, memory, and meta instructions.
-  - Includes iteration count and urgency warnings.
+  - Includes iteration count, urgency warnings, and worktree branch context.
   - Tells the agent where to save new skills.
 
 - `src/runner.rs`
   - Orchestrates the main agent loop.
+  - Creates a git worktree for isolation (default) or runs in the working tree (`--no-worktree`).
   - Starts or resumes a Codex session/thread.
   - Submits turns, consumes event stream, persists iteration summaries, and handles sleep/wake behavior.
   - Handles graceful ctrl-c shutdown and prints resume hint.
 
+- `src/workspace.rs`
+  - Workspace registry: tracks which projects a bot has been used in.
+  - Scopes memory per-project so each repo gets its own memory store.
+
 ## Runtime Data Flow
 
 1. `main` parses CLI and builds `BotConfig` with overrides.
-2. `runner::run(bot_name, config, resume_session)` loads skills + memory.
-3. Codex config is built and a thread is started (or resumed).
+2. `runner::run()` resolves the git repo root and creates a worktree (unless `--no-worktree`).
+3. Codex config is built (with cwd pointed at the worktree) and a thread is started (or resumed).
 4. For each iteration:
    - Skills are reloaded (picks up newly created skills).
    - `prompt::build_prompt` returns the full prompt.
@@ -71,7 +86,8 @@ This document explains the runtime architecture of `openbot` and how modules int
    - Last response is summarized and saved via `MemoryStore`.
 5. Loop exits on stop phrase, iteration limit, or ctrl-c.
 6. Runner sends `Op::Shutdown` with a 5-second timeout.
-7. Resume hint is printed with the session ID.
+7. Worktree directory is removed (branch is kept).
+8. Resume hint is printed with the session ID.
 
 ## Event Handling
 
@@ -91,6 +107,7 @@ Other events are ignored.
 
 - By default, `openbot` expects to run inside a git repository.
 - `--skip-git-check` disables that requirement.
+- Inside a git repo, each run gets its own worktree and branch for isolation. `--no-worktree` opts out.
 - Sandbox mode is controlled by bot config (`read-only`, `workspace-write`, `danger-full-access`).
 
 ## Prompt Composition
@@ -99,6 +116,7 @@ Each prompt includes:
 
 - Base instructions from bot config.
 - Current iteration marker with remaining count.
+- Worktree branch name and integration instructions (when running in a worktree).
 - Skills section (if any).
 - Memory entries and last 5 history items.
 - Standard completion instructions including the `TASK COMPLETE` convention.

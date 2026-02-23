@@ -1,6 +1,6 @@
 # Memory Format
 
-Each bot stores memory as JSON at `~/.openbot/bots/<name>/memory.json`.
+Memory is scoped per project workspace at `~/.openbot/bots/<name>/workspaces/<slug>/memory.json`. A global fallback exists at `~/.openbot/bots/<name>/memory.json`.
 
 ## Schema
 
@@ -48,3 +48,5 @@ This keeps continuity while reducing context growth.
 - Memory file and parent directories are created on first save.
 - Invalid JSON at the configured path will fail load.
 - `openbot memory <bot> clear` removes both entries and history.
+- Use `openbot memory <bot> --project <slug>` to manage memory for a specific workspace.
+- When running in a worktree, the workspace is resolved from the original repo root, so all worktrees of the same repo share one workspace.

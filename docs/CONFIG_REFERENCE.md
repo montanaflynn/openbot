@@ -67,12 +67,15 @@ Everything after the closing `+++` is the bot's instructions, sent as the base p
 
 For the `run` command:
 
-- `--prompt` overrides instructions (the markdown body).
-- `--max-iterations` overrides `max_iterations`.
-- `--model` overrides `model`.
-- `--sleep` overrides `sleep_secs`.
+- `-b, --bot` specifies which bot to run (required).
+- `-p, --prompt` overrides instructions (the markdown body).
+- `-n, --max-iterations` overrides `max_iterations`.
+- `-m, --model` overrides `model`.
+- `-s, --sleep` overrides `sleep_secs`.
 - `--skip-git-check` sets `skip_git_check = true`.
 - `--resume` resumes a previous session by ID.
+- `--project` targets a specific project workspace by slug.
+- `--no-worktree` disables worktree isolation (runs directly in the working tree).
 
 ## Example
 

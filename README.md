@@ -27,14 +27,21 @@ cargo install --path .
 # Create a bot
 openbot bots create secbot --description "Security auditor" --prompt "Audit this codebase for security issues"
 
-# Run it
-openbot run secbot
+# Run it (creates an isolated git worktree automatically)
+openbot run -b secbot
 
 # Run with overrides
-openbot run secbot -n 5 --model o4-mini
+openbot run -b secbot -n 5 --model o4-mini
+
+# Run multiple bots concurrently -- no conflicts
+openbot run -b secbot &
+openbot run -b testbot &
+
+# Run directly in the working tree (opt out of worktree isolation)
+openbot run -b secbot --no-worktree
 
 # Run outside a git repo
-openbot run secbot --skip-git-check
+openbot run -b secbot --skip-git-check
 ```
 
 ## Usage
@@ -45,25 +52,30 @@ openbot <COMMAND>
 Commands:
   run      Run a bot
   bots     Manage bots
-  skills   List skills for a bot
+  skills   Manage skills (list, search, install, remove)
   memory   Manage a bot's memory
   help     Print help
 ```
 
-### `openbot run <bot>`
+### `openbot run`
 
 Start the agent loop for a named bot. The agent runs the bot's instructions, sleeps, then runs again -- accumulating memory across iterations.
 
+Inside a git repo, each run automatically gets its own worktree and branch (`openbot/<bot>-<timestamp>`) so multiple bots can run concurrently without file conflicts. The worktree is cleaned up on exit; the branch is kept so no commits are lost.
+
 ```
-openbot run <BOT> [OPTIONS]
+openbot run [OPTIONS] --bot <BOT>
 
 Options:
+  -b, --bot <BOT>              Bot name
   -p, --prompt <PROMPT>        Override the bot's instructions
   -n, --max-iterations <N>     Max iterations, 0 for unlimited [default: 10]
   -m, --model <MODEL>          Model to use (e.g. o4-mini, gpt-4.1)
   -s, --sleep <SECONDS>        Sleep between iterations (overrides config)
       --skip-git-check         Allow running outside git repos
       --resume <SESSION_ID>    Resume a previous session
+      --project <SLUG>         Use a specific project workspace by slug
+      --no-worktree            Run directly in the working tree (skip worktree isolation)
 ```
 
 During the sleep window, type anything into stdin to wake the agent immediately and inject that text into its memory for the next iteration.
@@ -82,27 +94,28 @@ openbot bots create mybot -d "My helper" -p "..."   # Create with description + 
 openbot bots show mybot                              # Show config, skills, memory stats
 ```
 
-### `openbot skills <bot>`
+### `openbot skills`
 
-List all loaded skills for a bot (global + bot-local).
+Manage skills -- list, search, install, and remove.
 
+```sh
+openbot skills list <BOT>                            # List loaded skills
+openbot skills search "code review"                  # Search the skills.sh registry
+openbot skills install owner/repo/skill --global     # Install globally
+openbot skills install owner/repo/skill --bot mybot  # Install for a specific bot
+openbot skills remove skill-name --global            # Remove a global skill
 ```
-$ openbot skills secbot
-Skills for 'secbot' (1):
 
-  code-review - Review code for bugs and style issues
-    source: /Users/you/.openbot/skills/code-review.md
-```
+### `openbot memory`
 
-### `openbot memory <bot>`
-
-Inspect and manage a bot's persistent memory.
+Inspect and manage a bot's persistent memory. Memory is scoped per project workspace.
 
 ```sh
 openbot memory mybot show              # Display all entries and history
 openbot memory mybot set <KEY> <VALUE> # Store a key-value pair
 openbot memory mybot remove <KEY>      # Remove a key
 openbot memory mybot clear             # Wipe all memory
+openbot memory mybot --project slug show  # Target a specific workspace
 ```
 
 ## Directory structure
@@ -118,12 +131,17 @@ All data lives under `~/.openbot/`:
         ├── config.md          # Bot config (TOML frontmatter + markdown instructions)
         ├── skills/            # Bot-local skills
         │   └── custom.md
-        └── memory.json        # Persistent memory
+        ├── memory.json        # Global memory (fallback)
+        ├── workspaces.json    # Workspace registry
+        └── workspaces/        # Per-project memory
+            └── my-project/
+                └── memory.json
 ```
 
 - **Global skills** (`~/.openbot/skills/`) are available to every bot.
 - **Bot-local skills** (`~/.openbot/bots/<name>/skills/`) are only available to that bot.
 - Bots can create their own skills at runtime -- they're picked up on the next iteration.
+- **Memory is per-project** -- each project directory gets its own workspace with separate memory. Use `--project <slug>` to target a specific workspace from anywhere.
 
 ## Bot configuration
 
@@ -175,7 +193,7 @@ Place skills in `~/.openbot/skills/` for global availability, or in `~/.openbot/
 
 ## Memory
 
-Each bot maintains a `memory.json` that persists across runs. It contains:
+Each bot maintains per-project memory that persists across runs. It contains:
 
 - **Entries** -- a key-value store you can read/write from the CLI or that the agent populates
 - **History** -- a record of each iteration (timestamp, prompt summary, response summary)
@@ -188,14 +206,22 @@ openbot memory secbot set project_goal "migrate the database to PostgreSQL"
 openbot memory secbot set constraints "must maintain backward compatibility"
 
 # Then run -- the agent sees these entries in its prompt
-openbot run secbot
+openbot run -b secbot
+
+# Manage memory for a specific project workspace
+openbot memory secbot --project my-project show
 ```
 
 ## How it works
 
 ```
                   ┌─────────────────────────┐
-                  │    openbot run <bot>     │
+                  │    openbot run -b <bot>  │
+                  └────────────┬────────────┘
+                               │
+                  ┌────────────▼────────────┐
+                  │  Create git worktree    │
+                  │  (isolated branch)      │
                   └────────────┬────────────┘
                                │
                   ┌────────────▼────────────┐
@@ -220,11 +246,14 @@ openbot run secbot
            │   └───────────────┬───────────────┘
            │                   │
            │              stop phrase?──── yes ──► done
-           │                   │ no
-           │   ┌───────────────▼───────────────┐
-           │   │   Sleep (or wake on stdin)     │
-           └───┤                               │
-               └───────────────────────────────┘
+           │                   │ no                  │
+           │   ┌───────────────▼───────────────┐     │
+           │   │   Sleep (or wake on stdin)     │     │
+           └───┤                               │     │
+               └───────────────────────────────┘     │
+                  ┌──────────────────────────────────┘
+                  │  Remove worktree (keep branch)
+                  └──────────────────────────────
 ```
 
 Under the hood, openbot uses `codex-core` directly -- the same Rust library that powers the Codex CLI. It creates a `ThreadManager`, starts a `CodexThread`, and submits `Op::UserTurn` operations, processing the event stream for each iteration. Commands are auto-approved so the agent can work autonomously.
@@ -234,8 +263,8 @@ Under the hood, openbot uses `codex-core` directly -- the same Rust library that
 Set `RUST_LOG` to see what's happening:
 
 ```sh
-RUST_LOG=info openbot run secbot -n 1
-RUST_LOG=debug openbot run secbot -n 1
+RUST_LOG=info openbot run -b secbot -n 1
+RUST_LOG=debug openbot run -b secbot -n 1
 ```
 
 ## Reference Documentation
