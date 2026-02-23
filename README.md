@@ -15,6 +15,13 @@ cd openbot
 cargo install --path .
 ```
 
+The first build takes a few minutes since codex-core has a large dependency tree. For a faster debug build during development:
+
+```sh
+cargo build
+./target/debug/openbot --help
+```
+
 ## Quick start
 
 ```sh
@@ -200,6 +207,13 @@ Set `RUST_LOG` to see what's happening:
 RUST_LOG=info openbot run --prompt "hello" -n 1
 RUST_LOG=debug openbot run --prompt "hello" -n 1
 ```
+
+## Reference Documentation
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - runtime architecture and data flow
+- [`docs/CONFIG_REFERENCE.md`](docs/CONFIG_REFERENCE.md) - complete config key reference
+- [`docs/MEMORY_FORMAT.md`](docs/MEMORY_FORMAT.md) - persisted memory schema and semantics
+- [`docs/SKILLS_REFERENCE.md`](docs/SKILLS_REFERENCE.md) - built-in skill behavior and loading rules
 
 ## License
 
