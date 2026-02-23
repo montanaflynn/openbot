@@ -132,7 +132,6 @@ All data lives under `~/.openbot/`:
         ├── skills/            # Bot-local skills
         │   └── custom.md
         ├── memory.json        # Global memory (fallback)
-        ├── workspaces.json    # Workspace registry
         └── workspaces/        # Per-project memory
             └── my-project/
                 └── memory.json

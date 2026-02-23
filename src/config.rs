@@ -29,19 +29,9 @@ pub fn bot_memory_path(name: &str) -> Result<PathBuf> {
     Ok(bot_dir(name)?.join("memory.json"))
 }
 
-/// Bot workspaces registry path (`~/.openbot/bots/<name>/workspaces.json`).
-pub fn bot_workspaces_path(name: &str) -> Result<PathBuf> {
-    Ok(bot_dir(name)?.join("workspaces.json"))
-}
-
-/// Bot workspaces directory (`~/.openbot/bots/<name>/workspaces/`).
-pub fn bot_workspaces_dir(name: &str) -> Result<PathBuf> {
-    Ok(bot_dir(name)?.join("workspaces"))
-}
-
 /// Per-project memory path (`~/.openbot/bots/<name>/workspaces/<slug>/memory.json`).
 pub fn bot_workspace_memory_path(name: &str, slug: &str) -> Result<PathBuf> {
-    Ok(bot_workspaces_dir(name)?.join(slug).join("memory.json"))
+    Ok(bot_dir(name)?.join("workspaces").join(slug).join("memory.json"))
 }
 
 /// Bot config path (`~/.openbot/bots/<name>/config.md`).
@@ -63,7 +53,6 @@ pub fn bot_skills_manifest_path(name: &str) -> Result<PathBuf> {
 pub fn ensure_bot_dirs(name: &str) -> Result<()> {
     std::fs::create_dir_all(bot_dir(name)?)?;
     std::fs::create_dir_all(bot_skills_dir(name)?)?;
-    std::fs::create_dir_all(bot_workspaces_dir(name)?)?;
     Ok(())
 }
 

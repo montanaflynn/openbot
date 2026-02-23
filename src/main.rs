@@ -273,36 +273,10 @@ async fn main() -> Result<()> {
                 if mem_path.exists() {
                     let store = memory::MemoryStore::load(&mem_path)?;
                     println!(
-                        "  Memory (global): {} entries, {} history records",
+                        "  Memory: {} entries, {} history records",
                         store.memory.entries.len(),
                         store.memory.history.len()
                     );
-                }
-
-                let ws_path = config::bot_workspaces_path(&name)?;
-                let registry = workspace::WorkspaceRegistry::load(&ws_path)?;
-                if !registry.workspaces.is_empty() {
-                    println!("  Workspaces:");
-                    for (path, entry) in &registry.workspaces {
-                        let ws_mem_path = config::bot_workspace_memory_path(&name, &entry.slug)?;
-                        let mem_info = if ws_mem_path.exists() {
-                            let store = memory::MemoryStore::load(&ws_mem_path)?;
-                            format!(
-                                "{} entries, {} history",
-                                store.memory.entries.len(),
-                                store.memory.history.len()
-                            )
-                        } else {
-                            "no memory".into()
-                        };
-                        println!(
-                            "    {} → {} (last used: {}, {})",
-                            entry.slug,
-                            path,
-                            entry.last_used.format("%Y-%m-%d %H:%M"),
-                            mem_info,
-                        );
-                    }
                 }
 
                 let skill_dirs = config::BotConfig::skill_dirs(&name)?;

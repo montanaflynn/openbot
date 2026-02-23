@@ -23,7 +23,6 @@ This document explains the runtime architecture of `openbot` and how modules int
         ├── config.md          # Bot config (TOML frontmatter + markdown body)
         ├── skills/            # Bot-local skills
         ├── memory.json        # Global memory (fallback)
-        ├── workspaces.json    # Workspace registry
         └── workspaces/        # Per-project memory
             └── <slug>/
                 └── memory.json
@@ -70,8 +69,8 @@ This document explains the runtime architecture of `openbot` and how modules int
   - Handles graceful ctrl-c shutdown and prints resume hint.
 
 - `src/workspace.rs`
-  - Workspace registry: tracks which projects a bot has been used in.
-  - Scopes memory per-project so each repo gets its own memory store.
+  - Project root detection and slug derivation.
+  - Scopes memory per-project by deriving a slug from the directory name.
 
 ## Runtime Data Flow
 

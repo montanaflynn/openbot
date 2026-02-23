@@ -49,4 +49,6 @@ This keeps continuity while reducing context growth.
 - Invalid JSON at the configured path will fail load.
 - `openbot memory <bot> clear` removes both entries and history.
 - Use `openbot memory <bot> --project <slug>` to manage memory for a specific workspace.
+- The slug is derived from the project directory name (e.g. `/home/user/myapp` → `myapp`).
 - When running in a worktree, the workspace is resolved from the original repo root, so all worktrees of the same repo share one workspace.
+- The `~/.openbot/` directory is fully portable across machines — just rsync/copy it.

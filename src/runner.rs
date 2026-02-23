@@ -15,7 +15,7 @@ use crate::git::{self, WorktreeGuard, WorktreeInfo};
 use crate::memory::MemoryStore;
 use crate::prompt::build_prompt;
 use crate::skills::load_skills;
-use crate::workspace::{WorkspaceRegistry, detect_project_root};
+use crate::workspace::{detect_project_root, slug_from_path};
 
 /// Run the main agent loop, optionally resuming a previous session.
 pub async fn run(
@@ -100,29 +100,15 @@ pub async fn run(
         .await
         .with_context(|| "building codex config")?;
 
-    // Detect project workspace and load per-project memory.
+    // Derive a workspace slug from the project root directory name.
     // Use the original cwd (not the worktree) so worktrees of the same repo
-    // share one workspace entry.
-    let registry_path = crate::config::bot_workspaces_path(bot_name)?;
-    let mut registry = WorkspaceRegistry::load(&registry_path)
-        .with_context(|| "loading workspace registry")?;
-
+    // share one workspace.
     let workspace_slug = if let Some(ref slug) = project {
-        // Explicit --project flag: verify it exists in the registry.
-        if registry.find_by_slug(slug).is_none() {
-            anyhow::bail!(
-                "Unknown project '{slug}'. Run the bot from the project directory first to register it."
-            );
-        }
         slug.clone()
     } else {
         let project_root = detect_project_root(&cwd_for_check);
-        let canonical = project_root.to_string_lossy().to_string();
-        let slug = registry.register(&canonical);
-        registry
-            .save(&registry_path)
-            .with_context(|| "saving workspace registry")?;
-        eprintln!("Project: {} (workspace: {})", canonical, slug);
+        let slug = slug_from_path(&project_root);
+        eprintln!("Project: {} (workspace: {})", project_root.display(), slug);
         slug
     };
 
