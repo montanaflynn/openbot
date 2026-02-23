@@ -11,12 +11,20 @@ use tokio::sync::watch;
 use tracing::{error, warn};
 
 use crate::config::BotConfig;
+use crate::git::{self, WorktreeGuard, WorktreeInfo};
 use crate::memory::MemoryStore;
 use crate::prompt::build_prompt;
 use crate::skills::load_skills;
+use crate::workspace::{WorkspaceRegistry, detect_project_root};
 
 /// Run the main agent loop, optionally resuming a previous session.
-pub async fn run(bot_name: &str, config: BotConfig, resume_session: Option<String>) -> Result<()> {
+pub async fn run(
+    bot_name: &str,
+    config: BotConfig,
+    resume_session: Option<String>,
+    project: Option<String>,
+    no_worktree: bool,
+) -> Result<()> {
     let skill_dirs = BotConfig::skill_dirs(bot_name)?;
     {
         let skills = load_skills(&skill_dirs).unwrap_or_else(|_| Vec::new());
@@ -28,14 +36,6 @@ pub async fn run(bot_name: &str, config: BotConfig, resume_session: Option<Strin
         }
     }
 
-    let memory_path = BotConfig::memory_path(bot_name)?;
-    let mut memory = MemoryStore::load(&memory_path).with_context(|| "loading memory")?;
-    eprintln!(
-        "Memory: {} entries, {} history records",
-        memory.memory.entries.len(),
-        memory.memory.history.len()
-    );
-
     let _codex_home = find_codex_home().with_context(|| "finding codex home")?;
 
     let sandbox_mode = config.sandbox_mode();
@@ -44,13 +44,40 @@ pub async fn run(bot_name: &str, config: BotConfig, resume_session: Option<Strin
         _ => Some(AskForApproval::Never),
     };
 
+    // Resolve repo root and create worktree before building codex config so we
+    // can point codex at the worktree's cwd.
+    let cwd_for_check = std::env::current_dir().with_context(|| "getting current directory")?;
+    let repo_root = git::resolve_repo_root(&cwd_for_check);
+
+    if !config.skip_git_check && repo_root.is_none() {
+        anyhow::bail!("Not inside a git repository. Use --skip-git-check to run anyway.");
+    }
+
+    let worktree: Option<WorktreeInfo> = if !no_worktree {
+        if let Some(ref root) = repo_root {
+            let wt = git::create_worktree(root, bot_name)
+                .with_context(|| "creating git worktree")?;
+            eprintln!("Worktree: {} (branch: {})", wt.path.display(), wt.branch);
+            Some(wt)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Guard removes the worktree directory on exit (keeps the branch).
+    let _worktree_guard = worktree
+        .as_ref()
+        .map(|wt| WorktreeGuard::new(wt.path.clone()));
+
     let overrides = ConfigOverrides {
         model: config.model.clone(),
         review_model: None,
         config_profile: None,
         approval_policy,
         sandbox_mode: Some(sandbox_mode),
-        cwd: None,
+        cwd: worktree.as_ref().map(|wt| wt.path.clone()),
         model_provider: None,
         codex_linux_sandbox_exe: None,
         js_repl_node_path: None,
@@ -73,12 +100,40 @@ pub async fn run(bot_name: &str, config: BotConfig, resume_session: Option<Strin
         .await
         .with_context(|| "building codex config")?;
 
-    if !config.skip_git_check {
-        let cwd = codex_config.cwd.to_path_buf();
-        if codex_core::git_info::get_git_repo_root(&cwd).is_none() {
-            anyhow::bail!("Not inside a git repository. Use --skip-git-check to run anyway.");
+    // Detect project workspace and load per-project memory.
+    // Use the original cwd (not the worktree) so worktrees of the same repo
+    // share one workspace entry.
+    let registry_path = crate::config::bot_workspaces_path(bot_name)?;
+    let mut registry = WorkspaceRegistry::load(&registry_path)
+        .with_context(|| "loading workspace registry")?;
+
+    let workspace_slug = if let Some(ref slug) = project {
+        // Explicit --project flag: verify it exists in the registry.
+        if registry.find_by_slug(slug).is_none() {
+            anyhow::bail!(
+                "Unknown project '{slug}'. Run the bot from the project directory first to register it."
+            );
         }
-    }
+        slug.clone()
+    } else {
+        let project_root = detect_project_root(&cwd_for_check);
+        let canonical = project_root.to_string_lossy().to_string();
+        let slug = registry.register(&canonical);
+        registry
+            .save(&registry_path)
+            .with_context(|| "saving workspace registry")?;
+        eprintln!("Project: {} (workspace: {})", canonical, slug);
+        slug
+    };
+
+    let memory_path = crate::config::bot_workspace_memory_path(bot_name, &workspace_slug)?;
+    let mut memory = MemoryStore::load(&memory_path).with_context(|| "loading memory")?;
+    eprintln!(
+        "Memory: {} entries, {} history records (workspace: {})",
+        memory.memory.entries.len(),
+        memory.memory.history.len(),
+        workspace_slug,
+    );
 
     let auth_manager = AuthManager::shared(
         codex_config.codex_home.clone(),
@@ -201,6 +256,9 @@ pub async fn run(bot_name: &str, config: BotConfig, resume_session: Option<Strin
 
         let bot_skill_dir = crate::config::bot_skills_dir(bot_name)
             .unwrap_or_else(|_| std::path::PathBuf::from("skills"));
+        let wt_info = worktree
+            .as_ref()
+            .map(|wt| (wt.branch.as_str(), wt.base_branch.as_str()));
         let prompt = build_prompt(
             &config.instructions,
             &skills,
@@ -208,6 +266,8 @@ pub async fn run(bot_name: &str, config: BotConfig, resume_session: Option<Strin
             iteration,
             max_iterations,
             &bot_skill_dir,
+            Some(&workspace_slug),
+            wt_info,
         );
 
         let items = vec![UserInput::Text {

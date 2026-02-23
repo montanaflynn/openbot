@@ -1,9 +1,11 @@
 mod config;
+mod git;
 mod memory;
 mod prompt;
 mod registry;
 mod runner;
 mod skills;
+mod workspace;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -46,6 +48,14 @@ enum Commands {
         /// Resume a previous session by ID
         #[arg(long)]
         resume: Option<String>,
+
+        /// Use a specific project workspace by slug
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Disable worktree isolation (run directly in working tree)
+        #[arg(long)]
+        no_worktree: bool,
     },
 
     /// Manage bots
@@ -60,6 +70,10 @@ enum Commands {
     Memory {
         /// Bot name
         bot: String,
+
+        /// Project workspace slug (omit for global memory)
+        #[arg(long)]
+        project: Option<String>,
 
         #[command(subcommand)]
         action: MemoryAction,
@@ -160,6 +174,8 @@ async fn main() -> Result<()> {
             skip_git_check,
             sleep,
             resume,
+            project,
+            no_worktree,
         } => {
             // Ensure bot exists.
             config::ensure_global_dirs()?;
@@ -173,7 +189,7 @@ async fn main() -> Result<()> {
                 sleep,
             );
 
-            runner::run(&bot, cfg, resume).await?;
+            runner::run(&bot, cfg, resume, project, no_worktree).await?;
         }
 
         Commands::Bots(action) => match action {
@@ -257,10 +273,36 @@ async fn main() -> Result<()> {
                 if mem_path.exists() {
                     let store = memory::MemoryStore::load(&mem_path)?;
                     println!(
-                        "  Memory: {} entries, {} history records",
+                        "  Memory (global): {} entries, {} history records",
                         store.memory.entries.len(),
                         store.memory.history.len()
                     );
+                }
+
+                let ws_path = config::bot_workspaces_path(&name)?;
+                let registry = workspace::WorkspaceRegistry::load(&ws_path)?;
+                if !registry.workspaces.is_empty() {
+                    println!("  Workspaces:");
+                    for (path, entry) in &registry.workspaces {
+                        let ws_mem_path = config::bot_workspace_memory_path(&name, &entry.slug)?;
+                        let mem_info = if ws_mem_path.exists() {
+                            let store = memory::MemoryStore::load(&ws_mem_path)?;
+                            format!(
+                                "{} entries, {} history",
+                                store.memory.entries.len(),
+                                store.memory.history.len()
+                            )
+                        } else {
+                            "no memory".into()
+                        };
+                        println!(
+                            "    {} → {} (last used: {}, {})",
+                            entry.slug,
+                            path,
+                            entry.last_used.format("%Y-%m-%d %H:%M"),
+                            mem_info,
+                        );
+                    }
                 }
 
                 let skill_dirs = config::BotConfig::skill_dirs(&name)?;
@@ -375,8 +417,12 @@ async fn main() -> Result<()> {
             }
         },
 
-        Commands::Memory { bot, action } => {
-            let mem_path = config::BotConfig::memory_path(&bot)?;
+        Commands::Memory { bot, project, action } => {
+            let mem_path = if let Some(ref slug) = project {
+                config::bot_workspace_memory_path(&bot, slug)?
+            } else {
+                config::BotConfig::memory_path(&bot)?
+            };
             let mut store = memory::MemoryStore::load(&mem_path)?;
 
             match action {
