@@ -1,6 +1,6 @@
 # Memory Format
 
-Memory is scoped per project workspace at `~/.openbot/bots/<name>/workspaces/<slug>/memory.json`. A global fallback exists at `~/.openbot/bots/<name>/memory.json`.
+Memory is scoped per project workspace at `~/.openbot/bots/<name>/workspaces/<slug>/memory.json`. The slug is derived from the project directory name (e.g. `my-project`).
 
 ## Schema
 

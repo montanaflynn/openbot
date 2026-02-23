@@ -22,9 +22,8 @@ This document explains the runtime architecture of `openbot` and how modules int
     └── <name>/
         ├── config.md          # Bot config (TOML frontmatter + markdown body)
         ├── skills/            # Bot-local skills
-        ├── memory.json        # Global memory (fallback)
         └── workspaces/        # Per-project memory
-            └── <slug>/
+            └── <slug>/        # Slug derived from directory name
                 └── memory.json
 ```
 

@@ -108,14 +108,13 @@ openbot skills remove skill-name --global            # Remove a global skill
 
 ### `openbot memory`
 
-Inspect and manage a bot's persistent memory. Memory is scoped per project workspace.
+Inspect and manage a bot's persistent memory. Memory is scoped per project -- use `--project <slug>` to specify which workspace (the slug is the lowercased project directory name).
 
 ```sh
-openbot memory mybot show              # Display all entries and history
-openbot memory mybot set <KEY> <VALUE> # Store a key-value pair
-openbot memory mybot remove <KEY>      # Remove a key
-openbot memory mybot clear             # Wipe all memory
-openbot memory mybot --project slug show  # Target a specific workspace
+openbot memory mybot --project my-project show              # Display entries and history
+openbot memory mybot --project my-project set <KEY> <VALUE> # Store a key-value pair
+openbot memory mybot --project my-project remove <KEY>      # Remove a key
+openbot memory mybot --project my-project clear             # Wipe all memory
 ```
 
 ## Directory structure
@@ -131,16 +130,16 @@ All data lives under `~/.openbot/`:
         ├── config.md          # Bot config (TOML frontmatter + markdown instructions)
         ├── skills/            # Bot-local skills
         │   └── custom.md
-        ├── memory.json        # Global memory (fallback)
         └── workspaces/        # Per-project memory
-            └── my-project/
+            └── my-project/    # Slug derived from directory name
                 └── memory.json
 ```
 
 - **Global skills** (`~/.openbot/skills/`) are available to every bot.
 - **Bot-local skills** (`~/.openbot/bots/<name>/skills/`) are only available to that bot.
 - Bots can create their own skills at runtime -- they're picked up on the next iteration.
-- **Memory is per-project** -- each project directory gets its own workspace with separate memory. Use `--project <slug>` to target a specific workspace from anywhere.
+- **Memory is per-project** -- the slug is derived from the project directory name (e.g. `my-project`). Use `--project <slug>` to target a specific workspace from the CLI.
+- **Portable** -- `~/.openbot/` contains no absolute paths, just copy it to another machine.
 
 ## Bot configuration
 
@@ -201,14 +200,11 @@ Memory is injected into the agent's prompt each iteration, so the agent is aware
 
 ```sh
 # Seed the agent with context before running
-openbot memory secbot set project_goal "migrate the database to PostgreSQL"
-openbot memory secbot set constraints "must maintain backward compatibility"
+openbot memory secbot --project openbot set project_goal "migrate the database to PostgreSQL"
+openbot memory secbot --project openbot set constraints "must maintain backward compatibility"
 
 # Then run -- the agent sees these entries in its prompt
 openbot run -b secbot
-
-# Manage memory for a specific project workspace
-openbot memory secbot --project my-project show
 ```
 
 ## How it works
