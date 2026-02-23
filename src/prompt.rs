@@ -1,37 +1,48 @@
+use std::path::Path;
+
 use crate::memory::MemoryStore;
 use crate::skills::{Skill, format_skills_section};
 
-/// Build the full prompt for an iteration, combining instructions, skills, memory, and context.
+/// Build the full prompt for one iteration.
 pub fn build_prompt(
     instructions: &str,
     skills: &[Skill],
     memory: &MemoryStore,
     iteration: u32,
     max_iterations: u32,
+    bot_skill_dir: &Path,
 ) -> String {
     let mut prompt = String::new();
 
-    // Base instructions
+    // Base task instructions.
     prompt.push_str(instructions);
     prompt.push_str("\n\n");
 
-    // Iteration context
+    // Iteration context.
+    prompt.push_str("## Status\n");
     if max_iterations > 0 {
+        let remaining = max_iterations.saturating_sub(iteration);
         prompt.push_str(&format!(
-            "## Iteration {iteration}/{max_iterations}\n\n"
+            "- Iteration: {iteration} of {max_iterations} ({remaining} remaining)\n"
         ));
+        if remaining <= 2 && remaining > 0 {
+            prompt.push_str("- **Running low on iterations** -- prioritize finishing or say TASK COMPLETE\n");
+        } else if remaining == 0 {
+            prompt.push_str("- **This is your last iteration** -- wrap up and report final status\n");
+        }
     } else {
-        prompt.push_str(&format!("## Iteration {iteration}\n\n"));
+        prompt.push_str(&format!("- Iteration: {iteration} (unlimited)\n"));
     }
+    prompt.push('\n');
 
-    // Skills section
+    // Skills section.
     let skills_section = format_skills_section(skills);
     if !skills_section.is_empty() {
         prompt.push_str(&skills_section);
         prompt.push('\n');
     }
 
-    // Memory section
+    // Memory section.
     if !memory.memory.entries.is_empty() || !memory.memory.history.is_empty() {
         prompt.push_str("## Memory (from previous iterations)\n\n");
 
@@ -44,7 +55,6 @@ pub fn build_prompt(
 
         if !memory.memory.history.is_empty() {
             prompt.push_str("### Recent History\n");
-            // Show last 5 iterations to keep prompt manageable
             let recent: Vec<_> = memory
                 .memory
                 .history
@@ -66,11 +76,17 @@ pub fn build_prompt(
         }
     }
 
-    // Meta-instructions
+    // Instructions.
     prompt.push_str("## Instructions\n");
     prompt.push_str("- Complete as much of the task as you can\n");
     prompt.push_str("- Report what you accomplished and what remains\n");
     prompt.push_str("- When fully done, say \"TASK COMPLETE\"\n");
+    prompt.push_str(&format!(
+        "- If you develop a reusable procedure, save it as a skill in `{}/` \
+         (markdown with `name:` and `description:` frontmatter). \
+         It will be available next iteration.\n",
+        bot_skill_dir.display()
+    ));
 
     prompt
 }

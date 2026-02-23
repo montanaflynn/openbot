@@ -10,27 +10,26 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
 use tracing::{error, warn};
 
-use crate::config::OpenBotConfig;
+use crate::config::BotConfig;
 use crate::memory::MemoryStore;
 use crate::prompt::build_prompt;
 use crate::skills::load_skills;
 
 /// Run the main agent loop, optionally resuming a previous session.
-pub async fn run(config: OpenBotConfig, resume_session: Option<String>) -> Result<()> {
-    let skill_dirs = config.resolved_skill_dirs();
-    let skills = load_skills(&skill_dirs).unwrap_or_else(|e| {
-        warn!("failed to load skills: {e}");
-        Vec::new()
-    });
-
-    if !skills.is_empty() {
-        eprintln!("Loaded {} skill(s)", skills.len());
-        for skill in &skills {
-            eprintln!("  - {}: {}", skill.name, skill.description);
+pub async fn run(bot_name: &str, config: BotConfig, resume_session: Option<String>) -> Result<()> {
+    let skill_dirs = BotConfig::skill_dirs(bot_name)?;
+    {
+        let skills = load_skills(&skill_dirs).unwrap_or_else(|_| Vec::new());
+        if !skills.is_empty() {
+            eprintln!("Loaded {} skill(s)", skills.len());
+            for skill in &skills {
+                eprintln!("  - {}: {}", skill.name, skill.description);
+            }
         }
     }
 
-    let mut memory = MemoryStore::load(&config.memory_path).with_context(|| "loading memory")?;
+    let memory_path = BotConfig::memory_path(bot_name)?;
+    let mut memory = MemoryStore::load(&memory_path).with_context(|| "loading memory")?;
     eprintln!(
         "Memory: {} entries, {} history records",
         memory.memory.entries.len(),
@@ -194,12 +193,21 @@ pub async fn run(config: OpenBotConfig, resume_session: Option<String>) -> Resul
             }
         );
 
+        // Reload skills each iteration so newly created ones get picked up.
+        let skills = load_skills(&skill_dirs).unwrap_or_else(|e| {
+            warn!("failed to reload skills: {e}");
+            Vec::new()
+        });
+
+        let bot_skill_dir = crate::config::bot_skills_dir(bot_name)
+            .unwrap_or_else(|_| std::path::PathBuf::from("skills"));
         let prompt = build_prompt(
             &config.instructions,
             &skills,
             &memory,
             iteration,
             max_iterations,
+            &bot_skill_dir,
         );
 
         let items = vec![UserInput::Text {
