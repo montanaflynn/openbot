@@ -4505,6 +4505,7 @@ dependencies = [
  "codex-core",
  "codex-protocol",
  "codex-utils-absolute-path",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
