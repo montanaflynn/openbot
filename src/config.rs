@@ -38,6 +38,14 @@ pub fn bot_workspace_memory_path(name: &str, slug: &str) -> Result<PathBuf> {
         .join("memory.json"))
 }
 
+/// Per-project history directory (`~/.openbot/bots/<name>/workspaces/<slug>/history/`).
+pub fn bot_workspace_history_dir(name: &str, slug: &str) -> Result<PathBuf> {
+    Ok(bot_dir(name)?
+        .join("workspaces")
+        .join(slug)
+        .join("history"))
+}
+
 /// Bot config path (`~/.openbot/bots/<name>/config.md`).
 pub fn bot_config_path(name: &str) -> Result<PathBuf> {
     Ok(bot_dir(name)?.join("config.md"))
