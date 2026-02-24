@@ -16,12 +16,8 @@ pub struct Skill {
     pub description: String,
     /// Markdown body content (instructions and examples).
     pub body: String,
-    /// Source file path for provenance/debugging.
-    pub source_path: String,
     /// Registry source repo (e.g. "obra/superpowers"), if installed from registry.
     pub source: Option<String>,
-    /// When the skill was installed from the registry.
-    pub installed_at: Option<String>,
 }
 
 /// Load all markdown skills from the given directories.
@@ -68,9 +64,7 @@ fn parse_skill_file(path: &Path) -> Result<Skill> {
         name: fm.name,
         description: fm.description,
         body: fm.body,
-        source_path: path.display().to_string(),
         source: fm.source,
-        installed_at: fm.installed_at,
     })
 }
 
@@ -80,7 +74,6 @@ struct SkillFrontmatter {
     description: String,
     body: String,
     source: Option<String>,
-    installed_at: Option<String>,
 }
 
 /// Parse optional frontmatter from markdown content.
@@ -107,37 +100,31 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<SkillFrontmatter> {
 
     let trimmed = content.trim_start();
 
-    if !trimmed.starts_with("---") {
+    let Some(after_first) = trimmed.strip_prefix("---") else {
         return Ok(SkillFrontmatter {
             name: fallback_name(),
             description: String::new(),
             body: content.to_string(),
             source: None,
-            installed_at: None,
         });
-    }
+    };
 
-    // Find the closing delimiter after the opening `---`.
-    let after_first = &trimmed[3..];
     let Some(end_idx) = after_first.find("\n---") else {
         return Ok(SkillFrontmatter {
             name: fallback_name(),
             description: String::new(),
             body: content.to_string(),
             source: None,
-            installed_at: None,
         });
     };
 
     let frontmatter = &after_first[..end_idx];
-    let body_start = 3 + end_idx + 4; // "---" + frontmatter + "\n---"
-    let body = trimmed[body_start..].trim_start().to_string();
+    let body = after_first[end_idx + 4..].trim_start().to_string();
 
     // Parse known keys with a minimal line-based parser.
     let mut name = None;
     let mut description = None;
     let mut source = None;
-    let mut installed_at = None;
 
     for line in frontmatter.lines() {
         let line = line.trim();
@@ -147,8 +134,6 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<SkillFrontmatter> {
             description = Some(value.trim().to_string());
         } else if let Some(value) = line.strip_prefix("source:") {
             source = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("installed_at:") {
-            installed_at = Some(value.trim().to_string());
         }
     }
 
@@ -157,7 +142,6 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<SkillFrontmatter> {
         description: description.unwrap_or_default(),
         body,
         source,
-        installed_at,
     })
 }
 
@@ -169,20 +153,14 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<SkillFrontmatter> {
 ///
 /// If the fetched content already has frontmatter, `source` and `installed_at`
 /// fields are injected into it. Otherwise a new frontmatter block is prepended.
-pub fn install_skill(
-    skill_dir: &Path,
-    skill_id: &str,
-    source: &str,
-    content: &str,
-) -> Result<()> {
+pub fn install_skill(skill_dir: &Path, skill_id: &str, source: &str, content: &str) -> Result<()> {
     std::fs::create_dir_all(skill_dir)?;
 
     let now = Utc::now().to_rfc3339();
     let enriched = inject_frontmatter_fields(content, source, &now);
 
     let md_path = skill_dir.join(format!("{skill_id}.md"));
-    std::fs::write(&md_path, enriched)
-        .with_context(|| format!("writing {}", md_path.display()))?;
+    std::fs::write(&md_path, enriched).with_context(|| format!("writing {}", md_path.display()))?;
 
     Ok(())
 }
@@ -190,21 +168,17 @@ pub fn install_skill(
 /// Inject `source` and `installed_at` into existing frontmatter, or prepend new frontmatter.
 fn inject_frontmatter_fields(content: &str, source: &str, installed_at: &str) -> String {
     let trimmed = content.trim_start();
-    if trimmed.starts_with("---") {
-        let after_first = &trimmed[3..];
-        if let Some(end_idx) = after_first.find("\n---") {
-            // Insert before the closing ---
-            let fm = &after_first[..end_idx];
-            let rest = &trimmed[3 + end_idx..];
-            return format!(
-                "---{fm}\nsource: {source}\ninstalled_at: {installed_at}{rest}"
-            );
-        }
+    if let Some(after_first) = trimmed.strip_prefix("---")
+        && let Some(end_idx) = after_first.find("\n---")
+    {
+        // Insert before the closing ---
+        let fm = &after_first[..end_idx];
+        let rest = &after_first[end_idx..];
+        return format!("---{fm}\nsource: {source}\ninstalled_at: {installed_at}{rest}");
     }
+
     // No valid frontmatter — prepend one.
-    format!(
-        "---\nsource: {source}\ninstalled_at: {installed_at}\n---\n{content}"
-    )
+    format!("---\nsource: {source}\ninstalled_at: {installed_at}\n---\n{content}")
 }
 
 /// Remove a skill by deleting its markdown file.

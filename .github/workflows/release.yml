@@ -6,12 +6,47 @@ on:
       - "**"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: Verify release commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -A clippy::too_many_arguments -A clippy::collapsible_if
+
+      - name: Test
+        run: cargo test --workspace --all-features --locked --verbose
+
   build-assets:
     name: Build release assets (${{ matrix.os }})
+    needs: verify
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -57,6 +92,7 @@ jobs:
         with:
           name: release-${{ runner.os }}-${{ runner.arch }}
           path: openbot-${{ github.ref_name }}-${{ runner.os }}-${{ runner.arch }}.tar.gz
+          retention-days: 7
 
       - name: Upload artifact (Windows)
         if: runner.os == 'Windows'
@@ -64,11 +100,14 @@ jobs:
         with:
           name: release-${{ runner.os }}-${{ runner.arch }}
           path: openbot-${{ github.ref_name }}-${{ runner.os }}-${{ runner.arch }}.zip
+          retention-days: 7
 
   publish-release:
     name: Publish GitHub release
     runs-on: ubuntu-latest
     needs: build-assets
+    permissions:
+      contents: write
 
     steps:
       - name: Download release artifacts
@@ -82,4 +121,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: dist/*
