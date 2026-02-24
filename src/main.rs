@@ -360,13 +360,21 @@ async fn main() -> Result<()> {
                         results.count,
                         if results.count == 1 { "" } else { "s" }
                     );
+                    let max_id = results
+                        .skills
+                        .iter()
+                        .map(|s| s.id.len())
+                        .max()
+                        .unwrap_or(5);
+                    println!("  {:<max_id$}   {:>10}", "Skill", "Installs");
+                    println!("  {:<max_id$}   {:>10}", "─".repeat(max_id), "─".repeat(10));
                     for skill in &results.skills {
                         println!(
-                            "  {:40} {:>6} installs",
+                            "  {:<max_id$}   {:>10}",
                             skill.id, skill.installs,
                         );
                     }
-                    println!("\nInstall: openbot skills install <id> --bot <name>");
+                    println!("\nInstall: openbot skills install <id> [--bot <name> | --global]");
                 }
             }
             SkillsAction::Install { skill, global, bot } => {
