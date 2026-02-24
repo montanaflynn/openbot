@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use crate::history::SessionRecord;
 use crate::memory::MemoryStore;
 use crate::skills::{Skill, format_skills_section};
 
@@ -13,7 +14,8 @@ pub fn build_prompt(
     instructions: &str,
     skills: &[Skill],
     memory: &MemoryStore,
-    session_num: u32,
+    recent_history: &[SessionRecord],
+    session_num: usize,
     bot_skill_dir: &Path,
     project_context: Option<&str>,
     worktree_info: Option<(&str, &str)>,
@@ -32,9 +34,12 @@ pub fn build_prompt(
     prompt.push_str(&format!("- Session: {session_num}\n"));
     if let Some((branch, base_branch)) = worktree_info {
         prompt.push_str(&format!(
-            "- Branch: {branch} (worktree, based on {base_branch})\n\
-             - You are working in an isolated git worktree. \
-             Commit your changes and merge/push/PR as appropriate.\n"
+            "- Branch: `{branch}` (based on `{base_branch}`)\n\
+             - You are working in an isolated git worktree. Commit your changes on this branch.\n\
+             - When you call `session_complete`, choose an action for your commits:\n\
+             - `merge` — your branch gets merged into `{base_branch}`\n\
+             - `review` — leave the branch for the user to review\n\
+             - `discard` — drop the changes\n"
         ));
     }
     prompt.push('\n');
@@ -46,38 +51,26 @@ pub fn build_prompt(
         prompt.push('\n');
     }
 
-    // Memory section.
-    if !memory.memory.entries.is_empty() || !memory.memory.history.is_empty() {
+    // Memory section (agent's own key-value store).
+    if !memory.memory.entries.is_empty() {
         prompt.push_str("## Memory (from previous sessions)\n\n");
-
-        if !memory.memory.entries.is_empty() {
-            for (k, v) in &memory.memory.entries {
-                prompt.push_str(&format!("- **{k}**: {v}\n"));
-            }
-            prompt.push('\n');
+        for (k, v) in &memory.memory.entries {
+            prompt.push_str(&format!("- **{k}**: {v}\n"));
         }
+        prompt.push('\n');
+    }
 
-        if !memory.memory.history.is_empty() {
-            prompt.push_str("### Recent History\n");
-            let recent: Vec<_> = memory
-                .memory
-                .history
-                .iter()
-                .rev()
-                .take(5)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            for record in recent {
-                prompt.push_str(&format!(
-                    "- Session {}: {}\n",
-                    record.iteration,
-                    truncate(&record.response_summary, 200),
-                ));
-            }
-            prompt.push('\n');
+    // Recent history section.
+    if !recent_history.is_empty() {
+        prompt.push_str("### Recent History\n");
+        for record in recent_history {
+            prompt.push_str(&format!(
+                "- Session {}: {}\n",
+                record.session_number,
+                truncate(&record.response_summary, 200),
+            ));
         }
+        prompt.push('\n');
     }
 
     // Instructions.
