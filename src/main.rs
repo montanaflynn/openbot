@@ -5,6 +5,7 @@
 
 mod config;
 mod git;
+mod history;
 mod memory;
 mod prompt;
 mod registry;
@@ -72,6 +73,24 @@ enum Commands {
     /// Manage skills (list, search, install, remove)
     #[command(subcommand)]
     Skills(SkillsAction),
+
+    /// View session history for a bot
+    History {
+        /// Bot name
+        bot: String,
+
+        /// Project workspace slug
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Show a specific session by ID
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Number of recent sessions to show
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
 
     /// Manage a bot's memory
     Memory {
@@ -294,11 +313,7 @@ async fn main() -> Result<()> {
                 let mem_path = config::bot_memory_path(&name)?;
                 if mem_path.exists() {
                     let store = memory::MemoryStore::load(&mem_path)?;
-                    println!(
-                        "  Memory: {} entries, {} history records",
-                        store.memory.entries.len(),
-                        store.memory.history.len()
-                    );
+                    println!("  Memory: {} entries", store.memory.entries.len());
                 }
 
                 let skill_dirs = config::BotConfig::skill_dirs(&name)?;
@@ -326,8 +341,11 @@ async fn main() -> Result<()> {
                 } else {
                     println!("Skills for '{bot}' ({}):\n", skills.len());
                     for skill in &skills {
-                        println!("  {} - {}", skill.name, skill.description);
-                        println!("    source: {}", skill.source_path);
+                        let origin = skill
+                            .source
+                            .as_deref()
+                            .unwrap_or("local");
+                        println!("  {} - {} ({})", skill.name, skill.description, origin);
                     }
                 }
             }
@@ -343,27 +361,23 @@ async fn main() -> Result<()> {
                         if results.count == 1 { "" } else { "s" }
                     );
                     for skill in &results.skills {
-                        println!("  {} - {}", skill.id, skill.name);
-                        println!("    source: {}  installs: {}", skill.source, skill.installs);
+                        println!(
+                            "  {:40} {:>6} installs",
+                            skill.id, skill.installs,
+                        );
                     }
-                    println!("\nInstall with: openbot skills install <id> --global");
+                    println!("\nInstall: openbot skills install <id> --bot <name>");
                 }
             }
             SkillsAction::Install { skill, global, bot } => {
                 let (source, skill_id) = parse_skill_identifier(&skill)?;
 
-                let (skill_dir, manifest_path) = if global {
+                let skill_dir = if global {
                     config::ensure_global_dirs()?;
-                    (
-                        config::global_skills_dir()?,
-                        config::global_skills_manifest_path()?,
-                    )
+                    config::global_skills_dir()?
                 } else if let Some(ref bot_name) = bot {
                     config::ensure_bot_dirs(bot_name)?;
-                    (
-                        config::bot_skills_dir(bot_name)?,
-                        config::bot_skills_manifest_path(bot_name)?,
-                    )
+                    config::bot_skills_dir(bot_name)?
                 } else {
                     anyhow::bail!("specify --global or --bot <name>");
                 };
@@ -371,14 +385,7 @@ async fn main() -> Result<()> {
                 println!("Fetching {skill_id} from {source}...");
                 let content = registry::fetch_skill_md(&source, &skill_id).await?;
 
-                skills::install_skill(
-                    &skill_dir,
-                    &manifest_path,
-                    &skill_id,
-                    &source,
-                    &skill,
-                    &content,
-                )?;
+                skills::install_skill(&skill_dir, &skill_id, &source, &content)?;
 
                 let scope = if global {
                     "global".to_string()
@@ -388,27 +395,84 @@ async fn main() -> Result<()> {
                 println!("Installed skill '{skill_id}' ({scope}).");
             }
             SkillsAction::Remove { name, global, bot } => {
-                let (skill_dir, manifest_path) = if global {
-                    (
-                        config::global_skills_dir()?,
-                        config::global_skills_manifest_path()?,
-                    )
+                let skill_dir = if global {
+                    config::global_skills_dir()?
                 } else if let Some(ref bot_name) = bot {
-                    (
-                        config::bot_skills_dir(bot_name)?,
-                        config::bot_skills_manifest_path(bot_name)?,
-                    )
+                    config::bot_skills_dir(bot_name)?
                 } else {
                     anyhow::bail!("specify --global or --bot <name>");
                 };
 
-                if skills::remove_skill(&skill_dir, &manifest_path, &name)? {
+                if skills::remove_skill(&skill_dir, &name)? {
                     println!("Removed skill '{name}'.");
                 } else {
                     println!("Skill '{name}' not found.");
                 }
             }
         },
+
+        Commands::History {
+            bot,
+            project,
+            session,
+            limit,
+        } => {
+            let slug = project.unwrap_or_else(|| {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let root = workspace::detect_project_root(&cwd);
+                workspace::slug_from_path(&root)
+            });
+            let history_dir = config::bot_workspace_history_dir(&bot, &slug)?;
+
+            if let Some(ref id) = session {
+                // Show a single session.
+                match history::load(&history_dir, id) {
+                    Ok(record) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&record).unwrap_or_default()
+                        );
+                    }
+                    Err(e) => {
+                        println!("Session {id} not found: {e}");
+                    }
+                }
+            } else {
+                // List recent sessions.
+                let records = history::recent(&history_dir, limit)?;
+                if records.is_empty() {
+                    println!("No session history for bot '{bot}' (workspace: {slug}).");
+                } else {
+                    for record in &records {
+                        let duration = if record.duration_secs >= 60 {
+                            format!("{}m{}s", record.duration_secs / 60, record.duration_secs % 60)
+                        } else {
+                            format!("{}s", record.duration_secs)
+                        };
+                        let tokens = record
+                            .tokens
+                            .as_ref()
+                            .map(|t| {
+                                format!(
+                                    "{} in / {} out",
+                                    t.input_tokens, t.output_tokens
+                                )
+                            })
+                            .unwrap_or_default();
+                        let action = record.action.as_deref().unwrap_or("-");
+                        println!(
+                            "#{:<3} {} ({}, {}) [{}] {}",
+                            record.session_number,
+                            record.started_at.format("%Y-%m-%d %H:%M"),
+                            duration,
+                            tokens,
+                            action,
+                            truncate(&record.response_summary, 80),
+                        );
+                    }
+                }
+            }
+        }
 
         Commands::Memory {
             bot,

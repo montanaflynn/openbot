@@ -2,22 +2,27 @@
 //! optional worktree isolation for autonomous bot runs.
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use codex_core::config::{ConfigBuilder, ConfigOverrides, find_codex_home};
 use codex_core::{AuthManager, ThreadManager};
 use codex_protocol::dynamic_tools::{
     DynamicToolCallOutputContentItem, DynamicToolResponse, DynamicToolSpec,
 };
-use codex_protocol::protocol::{AskForApproval, EventMsg, Op, SessionSource};
+use codex_protocol::protocol::{
+    AskForApproval, EventMsg, Op, RateLimitSnapshot, SessionSource, TokenUsageInfo,
+};
 use codex_protocol::user_input::UserInput;
 use serde_json::json;
+use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
 use tracing::{error, warn};
 
 use crate::config::BotConfig;
 use crate::git::{self, WorktreeGuard, WorktreeInfo};
+use crate::history::{self, SessionRecord, TokenSnapshot};
 use crate::memory::MemoryStore;
 use crate::prompt::build_prompt;
 use crate::skills::load_skills;
@@ -36,9 +41,14 @@ fn session_tools() -> Vec<DynamicToolSpec> {
                 "summary": {
                     "type": "string",
                     "description": "Brief summary of what you accomplished this session"
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["merge", "review", "discard"],
+                    "description": "What to do with your changes: 'merge' to merge your branch into the base branch, 'review' to leave the branch for human review, 'discard' to drop your changes"
                 }
             },
-            "required": ["summary"]
+            "required": ["summary", "action"]
         }),
     }]
 }
@@ -52,15 +62,6 @@ pub async fn run(
     no_worktree: bool,
 ) -> Result<()> {
     let skill_dirs = BotConfig::skill_dirs(bot_name)?;
-    {
-        let skills = load_skills(&skill_dirs).unwrap_or_else(|_| Vec::new());
-        if !skills.is_empty() {
-            eprintln!("Loaded {} skill(s)", skills.len());
-            for skill in &skills {
-                eprintln!("  - {}: {}", skill.name, skill.description);
-            }
-        }
-    }
 
     let _codex_home = find_codex_home().with_context(|| "finding codex home")?;
 
@@ -81,7 +82,6 @@ pub async fn run(
         if let Some(ref root) = repo_root {
             let wt =
                 git::create_worktree(root, bot_name).with_context(|| "creating git worktree")?;
-            eprintln!("Worktree: {} (branch: {})", wt.path.display(), wt.branch);
             Some(wt)
         } else {
             None
@@ -131,19 +131,13 @@ pub async fn run(
         slug.clone()
     } else {
         let project_root = detect_project_root(&cwd_for_check);
-        let slug = slug_from_path(&project_root);
-        eprintln!("Project: {} (workspace: {})", project_root.display(), slug);
-        slug
+        slug_from_path(&project_root)
     };
 
     let memory_path = crate::config::bot_workspace_memory_path(bot_name, &workspace_slug)?;
     let mut memory = MemoryStore::load(&memory_path).with_context(|| "loading memory")?;
-    eprintln!(
-        "Memory: {} entries, {} history records (workspace: {})",
-        memory.memory.entries.len(),
-        memory.memory.history.len(),
-        workspace_slug,
-    );
+    let history_dir = crate::config::bot_workspace_history_dir(bot_name, &workspace_slug)?;
+    let history_count = history::count(&history_dir);
 
     let auth_manager = AuthManager::shared(
         codex_config.codex_home.clone(),
@@ -171,14 +165,12 @@ pub async fn run(
                 .with_context(|| format!("looking up session {session_id}"))?;
         match rollout_path {
             Some(path) => {
-                eprintln!("Resuming session {session_id}...");
                 thread_manager
                     .resume_thread_from_rollout(codex_config.clone(), path, auth_manager.clone())
                     .await
                     .with_context(|| "resuming session")?
             }
             None => {
-                eprintln!("Session {session_id} not found, starting new session.");
                 thread_manager
                     .start_thread_with_tools(codex_config.clone(), session_tools(), false)
                     .await
@@ -193,10 +185,6 @@ pub async fn run(
     };
 
     let session_id = session_configured.session_id.to_string();
-    eprintln!(
-        "Session {} (model: {})",
-        &session_id, &session_configured.model
-    );
 
     // Set up ctrl-c handler for graceful shutdown.
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -231,6 +219,13 @@ pub async fn run(
     let stdin = tokio::io::stdin();
     let mut stdin_reader = BufReader::new(stdin).lines();
 
+    let mut last_token_info: Option<TokenUsageInfo> = None;
+    let mut last_rate_limits: Option<RateLimitSnapshot> = None;
+    let mut worktree_result: Option<String> = None;
+    let mut duration_secs: u64 = 0;
+    let mut prompt_summary = String::new();
+    let mut response_summary = String::new();
+
     let session_limit = if max_sessions == 0 {
         u32::MAX
     } else {
@@ -242,24 +237,26 @@ pub async fn run(
             break;
         }
 
-        eprintln!("\n--- Session {} ---", session_num);
-
         // Reload skills each session so newly created ones get picked up.
         let skills = load_skills(&skill_dirs).unwrap_or_else(|e| {
             warn!("failed to reload skills: {e}");
             Vec::new()
         });
 
+        let total_session = history_count + session_num as usize;
+
         let bot_skill_dir = crate::config::bot_skills_dir(bot_name)
             .unwrap_or_else(|_| std::path::PathBuf::from("skills"));
         let wt_info = worktree
             .as_ref()
             .map(|wt| (wt.branch.as_str(), wt.base_branch.as_str()));
+        let recent_history = history::recent(&history_dir, 5).unwrap_or_default();
         let prompt = build_prompt(
             &config.instructions,
             &skills,
             &memory,
-            session_num,
+            &recent_history,
+            total_session,
             &bot_skill_dir,
             Some(&workspace_slug),
             wt_info,
@@ -269,6 +266,19 @@ pub async fn run(
             text: prompt.clone(),
             text_elements: Vec::new(),
         }];
+
+        // Print session header with config details.
+        eprintln!("\n## Session {}\n", total_session);
+        eprintln!("Model:     {}", default_model);
+        eprintln!("Workspace: {}", workspace_slug);
+        if let Some(ref wt) = worktree {
+            eprintln!("Branch:    {}", wt.branch);
+        }
+        eprintln!("Skills:    {}", skills.len());
+        eprintln!("Memory:    {} entries", memory.memory.entries.len());
+        eprintln!("History:   {} sessions", history_count);
+
+        let session_start = Instant::now();
 
         thread
             .submit(Op::UserTurn {
@@ -286,9 +296,11 @@ pub async fn run(
             .await
             .with_context(|| "submitting user turn")?;
 
+        eprintln!("\n### Output\n");
         let mut last_message = String::new();
         let mut session_completed = false;
         let mut completion_summary = String::new();
+        let mut completion_action = String::new();
 
         loop {
             let event = thread
@@ -298,23 +310,29 @@ pub async fn run(
 
             match &event.msg {
                 EventMsg::AgentMessage(msg) => {
+                    // AgentMessage contains the full accumulated text; prefer
+                    // streaming deltas when available and only use this as a
+                    // fallback so the message isn't printed twice.
                     if !msg.message.is_empty() {
-                        println!("{}", msg.message);
+                        if last_message.is_empty() {
+                            eprintln!("{}", msg.message);
+                        }
                         last_message = msg.message.clone();
                     }
                 }
                 EventMsg::AgentMessageDelta(delta) => {
                     if !delta.delta.is_empty() {
-                        print!("{}", delta.delta);
+                        eprint!("{}", delta.delta);
+                        std::io::stderr().flush().ok();
                         last_message.push_str(&delta.delta);
                     }
                 }
                 EventMsg::ExecCommandBegin(cmd) => {
-                    eprintln!("[exec] {}", cmd.command.join(" "));
+                    eprintln!("  $ {}", cmd.command.join(" "));
                 }
                 EventMsg::ExecCommandEnd(result) => {
                     if result.exit_code != 0 {
-                        eprintln!("[exec] exited with code {}", result.exit_code);
+                        eprintln!("  exit code {}", result.exit_code);
                     }
                 }
                 EventMsg::DynamicToolCallRequest(req) if req.tool == "session_complete" => {
@@ -324,8 +342,14 @@ pub async fn run(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    eprintln!("\n[session_complete] {summary}");
+                    let action = req
+                        .arguments
+                        .get("action")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("review")
+                        .to_string();
                     completion_summary = summary;
+                    completion_action = action;
                     session_completed = true;
 
                     // Respond to the tool call so the turn can finish.
@@ -363,26 +387,84 @@ pub async fn run(
                         .await
                         .ok();
                 }
+                EventMsg::TokenCount(tc) => {
+                    if let Some(ref info) = tc.info {
+                        last_token_info = Some(info.clone());
+                    }
+                    if let Some(ref rl) = tc.rate_limits {
+                        last_rate_limits = Some(rl.clone());
+                    }
+                }
                 _ => {}
             }
         }
 
+        // Ensure a clean newline after streamed LLM output.
+        eprintln!();
+
         // Save session results.
-        let prompt_summary = truncate_string(&config.instructions, 100);
-        let response_summary = if completion_summary.is_empty() {
+        duration_secs = session_start.elapsed().as_secs();
+        prompt_summary = truncate_string(&config.instructions, 100);
+        response_summary = if completion_summary.is_empty() {
             truncate_string(&last_message, 500)
         } else {
             completion_summary.clone()
         };
-        memory.add_iteration(session_num, &prompt_summary, &response_summary);
-        memory.save().with_context(|| "saving memory")?;
 
         if *shutdown_rx.borrow() {
             break;
         }
 
         if session_completed {
-            eprintln!("\nSession complete.");
+            // Post-hook: execute the action the LLM chose.
+            if let Some(ref wt) = worktree {
+                let result = match completion_action.as_str() {
+                    "merge" => {
+                        let mut result = format!(
+                            "merged {} into {}",
+                            wt.branch, wt.base_branch
+                        );
+                        let output = std::process::Command::new("git")
+                            .args(["checkout", &wt.base_branch])
+                            .current_dir(&cwd_for_check)
+                            .output();
+                        if let Ok(o) = output {
+                            if o.status.success() {
+                                let merge = std::process::Command::new("git")
+                                    .args(["merge", "--ff-only", &wt.branch])
+                                    .current_dir(&cwd_for_check)
+                                    .output();
+                                match merge {
+                                    Ok(m) if !m.status.success() => {
+                                        result = format!(
+                                            "merge failed; branch {} available for manual merge",
+                                            wt.branch
+                                        );
+                                    }
+                                    Err(_) => {
+                                        result = format!(
+                                            "merge failed; branch {} available for manual merge",
+                                            wt.branch
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        result
+                    }
+                    "discard" => {
+                        format!("discarded (branch {} kept)", wt.branch)
+                    }
+                    _ => {
+                        format!(
+                            "review branch {}\n  git log {}..{}\n  git merge {}",
+                            wt.branch, wt.base_branch, wt.branch, wt.branch
+                        )
+                    }
+                };
+                worktree_result = Some(result);
+            }
             break;
         }
 
@@ -393,7 +475,7 @@ pub async fn run(
         // Sleep between sessions, but wake on user input or ctrl-c.
         if config.sleep_secs > 0 {
             eprintln!(
-                "Sleeping {} seconds (type to wake and inject input)...",
+                "\n  Sleeping {}s (type to wake)...",
                 config.sleep_secs
             );
 
@@ -419,16 +501,80 @@ pub async fn run(
         }
     }
 
+    // Build and save the session record.
+    let tokens = last_token_info.as_ref().map(|info| {
+        let u = &info.total_token_usage;
+        TokenSnapshot {
+            input_tokens: u.input_tokens,
+            cached_input_tokens: u.cached_input_tokens,
+            output_tokens: u.output_tokens,
+            reasoning_output_tokens: u.reasoning_output_tokens,
+            context_window: info.model_context_window,
+        }
+    });
+
+    let record = SessionRecord {
+        session_id: session_id.clone(),
+        session_number: history_count + 1,
+        started_at: Utc::now(),
+        duration_secs,
+        model: default_model.clone(),
+        prompt_summary,
+        response_summary: response_summary.clone(),
+        action: worktree_result.clone(),
+        tokens,
+    };
+    history::save(&history_dir, &record).ok();
+
     // Print summary.
-    let total = memory.memory.history.len();
-    eprintln!("\n--- Summary ---");
-    eprintln!("Completed {} session(s)", total);
-    if let Some(last) = memory.memory.history.last() {
-        eprintln!(
-            "Last response: {}",
-            truncate_string(&last.response_summary, 200)
-        );
+    eprintln!("\n### Summary\n");
+    eprintln!("Result:    {}", truncate_string(&response_summary, 200));
+    if let Some(ref wt_result) = worktree_result {
+        eprintln!("Action:    {}", wt_result);
     }
+    eprintln!("Duration:  {}s", duration_secs);
+    if let Some(ref info) = last_token_info {
+        let u = &info.total_token_usage;
+        eprintln!(
+            "Tokens:    {} input ({} cached) / {} output ({} reasoning)",
+            u.input_tokens, u.cached_input_tokens, u.output_tokens, u.reasoning_output_tokens,
+        );
+        if let Some(ctx) = info.model_context_window {
+            let pct = u.percent_of_context_window_remaining(ctx);
+            eprintln!("Context:   {}% remaining ({} window)", pct, ctx);
+        }
+    }
+    if let Some(ref rl) = last_rate_limits {
+        if let Some(ref primary) = rl.primary {
+            let reset_str = match primary.resets_at {
+                Some(ts) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let remaining = (ts - now).max(0);
+                    if remaining >= 60 {
+                        format!(" (resets in {}m)", remaining / 60)
+                    } else {
+                        format!(" (resets in {}s)", remaining)
+                    }
+                }
+                None => String::new(),
+            };
+            eprintln!("Rate:      {:.0}% used{}", primary.used_percent, reset_str);
+        }
+        if let Some(ref credits) = rl.credits {
+            if credits.unlimited {
+                eprintln!("Credits:   unlimited");
+            } else if let Some(ref balance) = credits.balance {
+                eprintln!("Credits:   ${}", balance);
+            }
+        }
+        if let Some(ref plan) = rl.plan_type {
+            eprintln!("Plan:      {:?}", plan);
+        }
+    }
+    eprintln!("Resume:    openbot run --resume {session_id}");
 
     // Shut down codex with a timeout.
     thread.submit(Op::Shutdown).await.ok();
@@ -442,9 +588,6 @@ pub async fn run(
         }
     })
     .await;
-
-    // Always print resume hint so the user can pick up where they left off.
-    eprintln!("\nTo resume this session:\n  openbot run --resume {session_id}");
 
     Ok(())
 }
