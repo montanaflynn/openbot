@@ -46,11 +46,75 @@ pub fn create_worktree(repo_root: &Path, bot_name: &str) -> Result<WorktreeInfo>
         anyhow::bail!("git worktree add failed: {stderr}");
     }
 
+    // Copy uncommitted changes (tracked modifications + untracked files) into
+    // the worktree so the bot sees the same state as the user's working tree.
+    copy_dirty_state(repo_root, &wt_path)?;
+
     Ok(WorktreeInfo {
         path: wt_path,
         branch,
         base_branch,
     })
+}
+
+/// Copy dirty working-tree state from the source repo into a fresh worktree.
+///
+/// This handles two categories:
+/// 1. Tracked files with modifications (staged or unstaged) — copied via
+///    `git diff` to find changed paths, then file-level copy.
+/// 2. Untracked files — discovered via `git ls-files --others --exclude-standard`,
+///    then copied with directory structure preserved.
+fn copy_dirty_state(repo_root: &Path, wt_path: &Path) -> Result<()> {
+    // 1. Tracked modifications (unstaged + staged vs HEAD).
+    let diff_output = std::process::Command::new("git")
+        .args(["diff", "HEAD", "--name-only"])
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| "listing tracked changes")?;
+    let tracked_files = String::from_utf8_lossy(&diff_output.stdout);
+
+    for relpath in tracked_files.lines() {
+        let relpath = relpath.trim();
+        if relpath.is_empty() {
+            continue;
+        }
+        let src = repo_root.join(relpath);
+        let dst = wt_path.join(relpath);
+        if src.is_file() {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::copy(&src, &dst).ok();
+        } else if !src.exists() {
+            // File was deleted in the working tree — remove from worktree too.
+            std::fs::remove_file(&dst).ok();
+        }
+    }
+
+    // 2. Untracked files (respects .gitignore).
+    let untracked_output = std::process::Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| "listing untracked files")?;
+    let untracked_files = String::from_utf8_lossy(&untracked_output.stdout);
+
+    for relpath in untracked_files.lines() {
+        let relpath = relpath.trim();
+        if relpath.is_empty() {
+            continue;
+        }
+        let src = repo_root.join(relpath);
+        let dst = wt_path.join(relpath);
+        if src.is_file() {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::copy(&src, &dst).ok();
+        }
+    }
+
+    Ok(())
 }
 
 /// Remove a previously created worktree directory.
