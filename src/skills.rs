@@ -4,9 +4,7 @@
 //! frontmatter (`name`, `description`).
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use chrono::Utc;
 use std::path::Path;
 
 /// A skill loaded from a markdown file.
@@ -20,6 +18,10 @@ pub struct Skill {
     pub body: String,
     /// Source file path for provenance/debugging.
     pub source_path: String,
+    /// Registry source repo (e.g. "obra/superpowers"), if installed from registry.
+    pub source: Option<String>,
+    /// When the skill was installed from the registry.
+    pub installed_at: Option<String>,
 }
 
 /// Load all markdown skills from the given directories.
@@ -60,14 +62,25 @@ fn parse_skill_file(path: &Path) -> Result<Skill> {
     let contents =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
-    let (name, description, body) = parse_frontmatter(&contents, path)?;
+    let fm = parse_frontmatter(&contents, path)?;
 
     Ok(Skill {
-        name,
-        description,
-        body,
+        name: fm.name,
+        description: fm.description,
+        body: fm.body,
         source_path: path.display().to_string(),
+        source: fm.source,
+        installed_at: fm.installed_at,
     })
+}
+
+/// Parsed frontmatter fields from a skill markdown file.
+struct SkillFrontmatter {
+    name: String,
+    description: String,
+    body: String,
+    source: Option<String>,
+    installed_at: Option<String>,
 }
 
 /// Parse optional frontmatter from markdown content.
@@ -77,32 +90,43 @@ fn parse_skill_file(path: &Path) -> Result<Skill> {
 /// ---
 /// name: skill-name
 /// description: What this skill does
+/// source: obra/superpowers
+/// installed_at: 2026-02-24T05:00:00Z
 /// ---
 /// Body content here
 /// ```
 ///
 /// If frontmatter is missing or malformed, this falls back to filename-based
 /// naming and treats the full file as body.
-fn parse_frontmatter(content: &str, path: &Path) -> Result<(String, String, String)> {
+fn parse_frontmatter(content: &str, path: &Path) -> Result<SkillFrontmatter> {
+    let fallback_name = || {
+        path.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".into())
+    };
+
     let trimmed = content.trim_start();
 
     if !trimmed.starts_with("---") {
-        // No frontmatter: derive skill name from filename.
-        let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".into());
-        return Ok((name, String::new(), content.to_string()));
+        return Ok(SkillFrontmatter {
+            name: fallback_name(),
+            description: String::new(),
+            body: content.to_string(),
+            source: None,
+            installed_at: None,
+        });
     }
 
     // Find the closing delimiter after the opening `---`.
     let after_first = &trimmed[3..];
     let Some(end_idx) = after_first.find("\n---") else {
-        let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".into());
-        return Ok((name, String::new(), content.to_string()));
+        return Ok(SkillFrontmatter {
+            name: fallback_name(),
+            description: String::new(),
+            body: content.to_string(),
+            source: None,
+            installed_at: None,
+        });
     };
 
     let frontmatter = &after_first[..end_idx];
@@ -112,6 +136,8 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(String, String, Stri
     // Parse known keys with a minimal line-based parser.
     let mut name = None;
     let mut description = None;
+    let mut source = None;
+    let mut installed_at = None;
 
     for line in frontmatter.lines() {
         let line = line.trim();
@@ -119,110 +145,80 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(String, String, Stri
             name = Some(value.trim().to_string());
         } else if let Some(value) = line.strip_prefix("description:") {
             description = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("source:") {
+            source = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("installed_at:") {
+            installed_at = Some(value.trim().to_string());
         }
     }
 
-    let name = name.unwrap_or_else(|| {
-        path.file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".into())
-    });
-
-    Ok((name, description.unwrap_or_default(), body))
+    Ok(SkillFrontmatter {
+        name: name.unwrap_or_else(fallback_name),
+        description: description.unwrap_or_default(),
+        body,
+        source,
+        installed_at,
+    })
 }
 
 // ---------------------------------------------------------------------------
-// Manifest: tracking registry-installed skills
+// Install / remove skills
 // ---------------------------------------------------------------------------
 
-/// Metadata for a single registry-installed skill.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InstalledSkill {
-    /// Full registry id, e.g. "obra/superpowers/brainstorming".
-    pub id: String,
-    /// Short skill name, e.g. "brainstorming".
-    pub skill_id: String,
-    /// Source repository, e.g. "obra/superpowers".
-    pub source: String,
-    /// When the skill was installed.
-    pub installed_at: DateTime<Utc>,
-}
-
-/// Manifest tracking all registry-installed skills in a given scope.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SkillManifest {
-    /// Map of short skill id to installation metadata.
-    pub skills: BTreeMap<String, InstalledSkill>,
-}
-
-/// Load a skill manifest from disk, returning an empty one if the file is missing.
-pub fn load_manifest(path: &Path) -> Result<SkillManifest> {
-    if !path.exists() {
-        return Ok(SkillManifest::default());
-    }
-    let data =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&data).with_context(|| format!("parsing {}", path.display()))
-}
-
-/// Write a skill manifest to disk as pretty-printed JSON.
-pub fn save_manifest(path: &Path, manifest: &SkillManifest) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(manifest)?;
-    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
-}
-
-/// Install a skill: write the markdown file and update the manifest.
+/// Install a skill: write the markdown file with registry metadata in frontmatter.
+///
+/// If the fetched content already has frontmatter, `source` and `installed_at`
+/// fields are injected into it. Otherwise a new frontmatter block is prepended.
 pub fn install_skill(
     skill_dir: &Path,
-    manifest_path: &Path,
     skill_id: &str,
     source: &str,
-    registry_id: &str,
     content: &str,
 ) -> Result<()> {
     std::fs::create_dir_all(skill_dir)?;
 
-    let md_path = skill_dir.join(format!("{skill_id}.md"));
-    std::fs::write(&md_path, content).with_context(|| format!("writing {}", md_path.display()))?;
+    let now = Utc::now().to_rfc3339();
+    let enriched = inject_frontmatter_fields(content, source, &now);
 
-    let mut manifest = load_manifest(manifest_path)?;
-    manifest.skills.insert(
-        skill_id.to_string(),
-        InstalledSkill {
-            id: registry_id.to_string(),
-            skill_id: skill_id.to_string(),
-            source: source.to_string(),
-            installed_at: Utc::now(),
-        },
-    );
-    save_manifest(manifest_path, &manifest)?;
+    let md_path = skill_dir.join(format!("{skill_id}.md"));
+    std::fs::write(&md_path, enriched)
+        .with_context(|| format!("writing {}", md_path.display()))?;
 
     Ok(())
 }
 
-/// Remove a skill: delete the markdown file and its manifest entry.
+/// Inject `source` and `installed_at` into existing frontmatter, or prepend new frontmatter.
+fn inject_frontmatter_fields(content: &str, source: &str, installed_at: &str) -> String {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("---") {
+        let after_first = &trimmed[3..];
+        if let Some(end_idx) = after_first.find("\n---") {
+            // Insert before the closing ---
+            let fm = &after_first[..end_idx];
+            let rest = &trimmed[3 + end_idx..];
+            return format!(
+                "---{fm}\nsource: {source}\ninstalled_at: {installed_at}{rest}"
+            );
+        }
+    }
+    // No valid frontmatter — prepend one.
+    format!(
+        "---\nsource: {source}\ninstalled_at: {installed_at}\n---\n{content}"
+    )
+}
+
+/// Remove a skill by deleting its markdown file.
 /// Returns `true` if the skill was found and removed.
-pub fn remove_skill(skill_dir: &Path, manifest_path: &Path, skill_id: &str) -> Result<bool> {
+pub fn remove_skill(skill_dir: &Path, skill_id: &str) -> Result<bool> {
     let md_path = skill_dir.join(format!("{skill_id}.md"));
 
-    let file_removed = if md_path.exists() {
+    if md_path.exists() {
         std::fs::remove_file(&md_path)
             .with_context(|| format!("removing {}", md_path.display()))?;
-        true
+        Ok(true)
     } else {
-        false
-    };
-
-    let mut manifest = load_manifest(manifest_path)?;
-    let entry_removed = manifest.skills.remove(skill_id).is_some();
-    if entry_removed {
-        save_manifest(manifest_path, &manifest)?;
+        Ok(false)
     }
-
-    Ok(file_removed || entry_removed)
 }
 
 // ---------------------------------------------------------------------------

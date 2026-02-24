@@ -51,15 +51,7 @@ pub fn bot_config_path(name: &str) -> Result<PathBuf> {
     Ok(bot_dir(name)?.join("config.md"))
 }
 
-/// Global skills manifest (`~/.openbot/skills/manifest.json`).
-pub fn global_skills_manifest_path() -> Result<PathBuf> {
-    Ok(global_skills_dir()?.join("manifest.json"))
-}
 
-/// Bot-local skills manifest (`~/.openbot/bots/<name>/skills/manifest.json`).
-pub fn bot_skills_manifest_path(name: &str) -> Result<PathBuf> {
-    Ok(bot_skills_dir(name)?.join("manifest.json"))
-}
 
 /// Ensure the bot directory structure exists.
 pub fn ensure_bot_dirs(name: &str) -> Result<()> {
