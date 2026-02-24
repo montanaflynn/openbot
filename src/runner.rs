@@ -2,8 +2,12 @@ use anyhow::{Context, Result};
 use codex_core::config::{ConfigBuilder, ConfigOverrides, find_codex_home};
 use codex_core::{AuthManager, ThreadManager};
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::dynamic_tools::{
+    DynamicToolCallOutputContentItem, DynamicToolResponse, DynamicToolSpec,
+};
 use codex_protocol::protocol::{AskForApproval, EventMsg, Op, SessionSource};
 use codex_protocol::user_input::UserInput;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -16,6 +20,26 @@ use crate::memory::MemoryStore;
 use crate::prompt::build_prompt;
 use crate::skills::load_skills;
 use crate::workspace::{detect_project_root, slug_from_path};
+
+/// Build the dynamic tool specs registered with each codex session.
+fn session_tools() -> Vec<DynamicToolSpec> {
+    vec![DynamicToolSpec {
+        name: "session_complete".into(),
+        description: "Signal that you have finished your work for this session. \
+            Call this when you have completed your task or made all the progress you can."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "Brief summary of what you accomplished this session"
+                }
+            },
+            "required": ["summary"]
+        }),
+    }]
+}
 
 /// Run the main agent loop, optionally resuming a previous session.
 pub async fn run(
@@ -160,14 +184,14 @@ pub async fn run(
             None => {
                 eprintln!("Session {session_id} not found, starting new session.");
                 thread_manager
-                    .start_thread(codex_config.clone())
+                    .start_thread_with_tools(codex_config.clone(), session_tools(), false)
                     .await
                     .with_context(|| "starting codex thread")?
             }
         }
     } else {
         thread_manager
-            .start_thread(codex_config.clone())
+            .start_thread_with_tools(codex_config.clone(), session_tools(), false)
             .await
             .with_context(|| "starting codex thread")?
     };
@@ -202,39 +226,26 @@ pub async fn run(
             .await
     };
 
-    let max_iterations = config.max_iterations;
-    let stop_phrase = config
-        .stop_phrase
-        .clone()
-        .unwrap_or_else(|| "TASK COMPLETE".into());
+    let max_sessions = config.max_iterations;
     let sleep_duration = Duration::from_secs(config.sleep_secs);
 
     let stdin = tokio::io::stdin();
     let mut stdin_reader = BufReader::new(stdin).lines();
 
-    let iteration_limit = if max_iterations == 0 {
+    let session_limit = if max_sessions == 0 {
         u32::MAX
     } else {
-        max_iterations
+        max_sessions
     };
 
-    'outer: for iteration in 1..=iteration_limit {
-        // Check if ctrl-c was pressed before starting a new iteration.
+    'outer: for session_num in 1..=session_limit {
         if *shutdown_rx.borrow() {
             break;
         }
 
-        eprintln!(
-            "\n--- Iteration {}/{} ---",
-            iteration,
-            if max_iterations == 0 {
-                "∞".to_string()
-            } else {
-                max_iterations.to_string()
-            }
-        );
+        eprintln!("\n--- Session {} ---", session_num);
 
-        // Reload skills each iteration so newly created ones get picked up.
+        // Reload skills each session so newly created ones get picked up.
         let skills = load_skills(&skill_dirs).unwrap_or_else(|e| {
             warn!("failed to reload skills: {e}");
             Vec::new()
@@ -249,8 +260,7 @@ pub async fn run(
             &config.instructions,
             &skills,
             &memory,
-            iteration,
-            max_iterations,
+            session_num,
             &bot_skill_dir,
             Some(&workspace_slug),
             wt_info,
@@ -278,6 +288,8 @@ pub async fn run(
             .with_context(|| "submitting user turn")?;
 
         let mut last_message = String::new();
+        let mut session_completed = false;
+        let mut completion_summary = String::new();
 
         loop {
             let event = thread
@@ -306,11 +318,35 @@ pub async fn run(
                         eprintln!("[exec] exited with code {}", result.exit_code);
                     }
                 }
+                EventMsg::DynamicToolCallRequest(req) if req.tool == "session_complete" => {
+                    let summary = req
+                        .arguments
+                        .get("summary")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    eprintln!("\n[session_complete] {summary}");
+                    completion_summary = summary;
+                    session_completed = true;
+
+                    // Respond to the tool call so the turn can finish.
+                    thread
+                        .submit(Op::DynamicToolResponse {
+                            id: req.call_id.clone(),
+                            response: DynamicToolResponse {
+                                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                                    text: "Session complete. Good work.".into(),
+                                }],
+                                success: true,
+                            },
+                        })
+                        .await
+                        .ok();
+                }
                 EventMsg::TurnComplete(_) => {
                     break;
                 }
                 EventMsg::TurnAborted(_) => {
-                    // Turn was interrupted (e.g. by ctrl-c).
                     break;
                 }
                 EventMsg::Error(e) => {
@@ -332,26 +368,30 @@ pub async fn run(
             }
         }
 
-        // Save iteration results.
+        // Save session results.
         let prompt_summary = truncate_string(&config.instructions, 100);
-        let response_summary = truncate_string(&last_message, 500);
-        memory.add_iteration(iteration, &prompt_summary, &response_summary);
+        let response_summary = if completion_summary.is_empty() {
+            truncate_string(&last_message, 500)
+        } else {
+            completion_summary.clone()
+        };
+        memory.add_iteration(session_num, &prompt_summary, &response_summary);
         memory.save().with_context(|| "saving memory")?;
 
         if *shutdown_rx.borrow() {
             break;
         }
 
-        if last_message.contains(&stop_phrase) {
-            eprintln!("\nAgent signaled completion: \"{stop_phrase}\"");
+        if session_completed {
+            eprintln!("\nSession complete.");
             break;
         }
 
-        if iteration >= iteration_limit {
+        if session_num >= session_limit {
             break;
         }
 
-        // Sleep between iterations, but wake on user input or ctrl-c.
+        // Sleep between sessions, but wake on user input or ctrl-c.
         if config.sleep_secs > 0 {
             eprintln!(
                 "Sleeping {} seconds (type to wake and inject input)...",
@@ -363,7 +403,7 @@ pub async fn run(
                 line = stdin_reader.next_line() => {
                     match line {
                         Ok(Some(input)) if !input.trim().is_empty() => {
-                            eprintln!("User input received, injecting into next iteration.");
+                            eprintln!("User input received, injecting into next session.");
                             memory.set("user_input".into(), input);
                             memory.save().ok();
                         }
@@ -383,7 +423,7 @@ pub async fn run(
     // Print summary.
     let total = memory.memory.history.len();
     eprintln!("\n--- Summary ---");
-    eprintln!("Completed {} iteration(s)", total);
+    eprintln!("Completed {} session(s)", total);
     if let Some(last) = memory.memory.history.last() {
         eprintln!(
             "Last response: {}",
