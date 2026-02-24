@@ -12,45 +12,105 @@ use codex_protocol::protocol::{
     AskForApproval, EventMsg, Op, RateLimitSnapshot, SessionSource, TokenUsageInfo,
 };
 use codex_protocol::user_input::UserInput;
+use crossterm::event::{KeyCode, KeyModifiers};
 use serde_json::json;
-use std::io::Write;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::watch;
 use tracing::{error, warn};
 
 use crate::config::BotConfig;
 use crate::git::{self, WorktreeGuard, WorktreeInfo};
-use crate::history::{self, SessionRecord, TokenSnapshot};
+use crate::history::{
+    self, CommandEntry, SessionEvent, SessionRecord, SessionWriter, TokenSnapshot,
+};
 use crate::memory::MemoryStore;
 use crate::prompt::build_prompt;
 use crate::skills::load_skills;
+use crate::tui::{AppState, Tui, TuiEvent};
 use crate::workspace::{detect_project_root, slug_from_path};
 
 /// Build the dynamic tool specs registered with each codex session.
 fn session_tools() -> Vec<DynamicToolSpec> {
-    vec![DynamicToolSpec {
-        name: "session_complete".into(),
-        description: "Signal that you have finished your work for this session. \
-            Call this when you have completed your task or made all the progress you can."
-            .into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "summary": {
-                    "type": "string",
-                    "description": "Brief summary of what you accomplished this session"
+    vec![
+        DynamicToolSpec {
+            name: "session_complete".into(),
+            description: "Signal that you have finished your work for this session. \
+                Call this when you have completed your task or made all the progress you can."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Brief summary of what you accomplished this session"
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["merge", "review", "discard"],
+                        "description": "What to do with your changes: 'merge' to merge your branch into the base branch, 'review' to leave the branch for human review, 'discard' to drop your changes"
+                    }
                 },
-                "action": {
-                    "type": "string",
-                    "enum": ["merge", "review", "discard"],
-                    "description": "What to do with your changes: 'merge' to merge your branch into the base branch, 'review' to leave the branch for human review, 'discard' to drop your changes"
-                }
-            },
-            "required": ["summary", "action"]
-        }),
-    }]
+                "required": ["summary", "action"]
+            }),
+        },
+        DynamicToolSpec {
+            name: "session_history".into(),
+            description: "Browse previous session history. Use action='list' for an overview \
+                or action='view' with a session_number to read full transcript and commands. \
+                Supports pagination with offset/limit."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "view"],
+                        "description": "Action to perform: 'list' shows all sessions, 'view' shows details for a specific session"
+                    },
+                    "session_number": {
+                        "type": "integer",
+                        "description": "Session number to view (required for 'view' action)"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Line offset for pagination (default 0)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max lines to return (default 50)"
+                    },
+                    "section": {
+                        "type": "string",
+                        "enum": ["response", "commands", "all"],
+                        "description": "Which section to view: 'response', 'commands', or 'all' (default 'all')"
+                    }
+                },
+                "required": ["action"]
+            }),
+        },
+    ]
+}
+
+/// Dual-mode output helper: TUI when interactive, plain stderr when piped.
+fn emit(state: &mut Option<AppState>, text: &str, newline: bool) {
+    match state {
+        Some(s) => {
+            if newline {
+                s.append_line(text);
+            } else {
+                s.append_text(text);
+            }
+        }
+        None => {
+            if newline {
+                eprintln!("{text}");
+            } else {
+                eprint!("{text}");
+            }
+        }
+    }
 }
 
 /// Run the main agent loop, optionally resuming a previous session.
@@ -135,7 +195,7 @@ pub async fn run(
     };
 
     let memory_path = crate::config::bot_workspace_memory_path(bot_name, &workspace_slug)?;
-    let mut memory = MemoryStore::load(&memory_path).with_context(|| "loading memory")?;
+    let memory = MemoryStore::load(&memory_path).with_context(|| "loading memory")?;
     let history_dir = crate::config::bot_workspace_history_dir(bot_name, &workspace_slug)?;
     let history_count = history::count(&history_dir);
 
@@ -164,18 +224,14 @@ pub async fn run(
                 .await
                 .with_context(|| format!("looking up session {session_id}"))?;
         match rollout_path {
-            Some(path) => {
-                thread_manager
-                    .resume_thread_from_rollout(codex_config.clone(), path, auth_manager.clone())
-                    .await
-                    .with_context(|| "resuming session")?
-            }
-            None => {
-                thread_manager
-                    .start_thread_with_tools(codex_config.clone(), session_tools(), false)
-                    .await
-                    .with_context(|| "starting codex thread")?
-            }
+            Some(path) => thread_manager
+                .resume_thread_from_rollout(codex_config.clone(), path, auth_manager.clone())
+                .await
+                .with_context(|| "resuming session")?,
+            None => thread_manager
+                .start_thread_with_tools(codex_config.clone(), session_tools(), false)
+                .await
+                .with_context(|| "starting codex thread")?,
         }
     } else {
         thread_manager
@@ -185,19 +241,6 @@ pub async fn run(
     };
 
     let session_id = session_configured.session_id.to_string();
-
-    // Set up ctrl-c handler for graceful shutdown.
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let thread_for_ctrlc = thread.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("\nInterrupted, shutting down gracefully...");
-            // Signal the main loop to stop.
-            shutdown_tx.send(true).ok();
-            // Tell codex to abort any in-flight work.
-            thread_for_ctrlc.submit(Op::Interrupt).await.ok();
-        }
-    });
 
     let default_cwd = codex_config.cwd.to_path_buf();
     let default_approval_policy = codex_config.permissions.approval_policy.value();
@@ -216,15 +259,35 @@ pub async fn run(
     let max_sessions = config.max_iterations;
     let sleep_duration = Duration::from_secs(config.sleep_secs);
 
-    let stdin = tokio::io::stdin();
-    let mut stdin_reader = BufReader::new(stdin).lines();
+    // Detect whether we have an interactive terminal.
+    let is_tty = std::io::stderr().is_terminal();
 
+    // Interactive: ratatui TUI with alternate screen.
+    // Non-interactive: plain stderr + line-buffered stdin.
+    let mut tui: Option<Tui> = if is_tty {
+        Some(Tui::new().with_context(|| "initializing TUI")?)
+    } else {
+        None
+    };
+    let mut state: Option<AppState> = if is_tty { Some(AppState::new()) } else { None };
+
+    // Fallback line reader for non-interactive (piped) mode.
+    let stdin = tokio::io::stdin();
+    let mut stdin_reader = if !is_tty {
+        Some(BufReader::new(stdin).lines())
+    } else {
+        None
+    };
+
+    let mut pending_input: Option<String> = None;
     let mut last_token_info: Option<TokenUsageInfo> = None;
     let mut last_rate_limits: Option<RateLimitSnapshot> = None;
     let mut worktree_result: Option<String> = None;
     let mut duration_secs: u64 = 0;
     let mut prompt_summary = String::new();
     let mut response_summary = String::new();
+    let mut last_message = String::new();
+    let mut commands_log: Vec<CommandEntry> = Vec::new();
 
     let session_limit = if max_sessions == 0 {
         u32::MAX
@@ -232,11 +295,9 @@ pub async fn run(
         max_sessions
     };
 
-    'outer: for session_num in 1..=session_limit {
-        if *shutdown_rx.borrow() {
-            break;
-        }
+    let mut event_writer: Option<SessionWriter> = None;
 
+    'outer: for session_num in 1..=session_limit {
         // Reload skills each session so newly created ones get picked up.
         let skills = load_skills(&skill_dirs).unwrap_or_else(|e| {
             warn!("failed to reload skills: {e}");
@@ -260,7 +321,11 @@ pub async fn run(
             &bot_skill_dir,
             Some(&workspace_slug),
             wt_info,
+            pending_input.as_deref(),
         );
+
+        // Consume pending input once it's included in the prompt.
+        pending_input = None;
 
         let items = vec![UserInput::Text {
             text: prompt.clone(),
@@ -268,17 +333,53 @@ pub async fn run(
         }];
 
         // Print session header with config details.
-        eprintln!("\n## Session {}\n", total_session);
-        eprintln!("Model:     {}", default_model);
-        eprintln!("Workspace: {}", workspace_slug);
+        emit(
+            &mut state,
+            &format!("\n## Session {}\n", total_session),
+            true,
+        );
+        emit(&mut state, &format!("Model:     {}", default_model), true);
+        emit(&mut state, &format!("Workspace: {}", workspace_slug), true);
         if let Some(ref wt) = worktree {
-            eprintln!("Branch:    {}", wt.branch);
+            emit(&mut state, &format!("Branch:    {}", wt.branch), true);
         }
-        eprintln!("Skills:    {}", skills.len());
-        eprintln!("Memory:    {} entries", memory.memory.entries.len());
-        eprintln!("History:   {} sessions", history_count);
+        emit(&mut state, &format!("Skills:    {}", skills.len()), true);
+        emit(
+            &mut state,
+            &format!("Memory:    {} entries", memory.memory.entries.len()),
+            true,
+        );
+        emit(
+            &mut state,
+            &format!("History:   {} sessions", history_count),
+            true,
+        );
+
+        // Update status bar for TUI mode.
+        if let Some(ref mut s) = state {
+            let mut status_parts = vec![default_model.clone()];
+            status_parts.push(format!("session {}", total_session));
+            s.status = status_parts.join(" | ");
+        }
 
         let session_start = Instant::now();
+
+        // Create the event writer to stream events to disk.
+        let initial_record = SessionRecord {
+            session_id: session_id.clone(),
+            session_number: total_session,
+            started_at: Utc::now(),
+            duration_secs: 0,
+            model: default_model.clone(),
+            prompt_summary: truncate_string(&config.instructions, 100),
+            response_summary: String::new(),
+            action: None,
+            tokens: None,
+            command_count: Some(0),
+        };
+        event_writer = SessionWriter::create(&history_dir, &initial_record)
+            .map_err(|e| warn!("failed to create event writer: {e}"))
+            .ok();
 
         thread
             .submit(Op::UserTurn {
@@ -296,17 +397,121 @@ pub async fn run(
             .await
             .with_context(|| "submitting user turn")?;
 
-        eprintln!("\n### Output\n");
-        let mut last_message = String::new();
+        emit(&mut state, "\n### Output\n", true);
+        last_message.clear();
+        commands_log.clear();
         let mut session_completed = false;
         let mut completion_summary = String::new();
         let mut completion_action = String::new();
 
         loop {
-            let event = thread
-                .next_event()
-                .await
-                .with_context(|| "receiving event")?;
+            // Listen for codex events, TUI events, and piped stdin.
+            let event = tokio::select! {
+                ev = thread.next_event() => ev.with_context(|| "receiving event")?,
+
+                // TUI events (interactive mode).
+                Some(tui_event) = async {
+                    match tui.as_mut() {
+                        Some(t) => t.next_event().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match tui_event {
+                        TuiEvent::Key(key) => {
+                            match (key.code, key.modifiers) {
+                                (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                                    break 'outer;
+                                }
+                                (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
+                                    let empty = state.as_ref().is_none_or(|s| s.input_buf.is_empty());
+                                    if empty { break 'outer; }
+                                }
+                                (KeyCode::Esc, _) => {
+                                    emit(&mut state, "  [interrupting...]", true);
+                                    thread.submit(Op::Interrupt).await.ok();
+                                }
+                                (KeyCode::Enter, _) => {
+                                    if let Some(ref mut s) = state {
+                                        let text = s.take_input();
+                                        if !text.trim().is_empty() {
+                                            let items = vec![UserInput::Text {
+                                                text: text.clone(),
+                                                text_elements: Vec::new(),
+                                            }];
+                                            match thread.steer_input(items, None).await {
+                                                Ok(_) => emit(&mut state, &format!("  [steered: {}]", text), true),
+                                                Err(_) => {
+                                                    emit(&mut state, &format!("  [queued: {}]", text), true);
+                                                    pending_input = Some(text);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                (KeyCode::Backspace, _) => {
+                                    if let Some(ref mut s) = state {
+                                        s.backspace();
+                                    }
+                                }
+                                (KeyCode::Char(ch), m) if !m.contains(KeyModifiers::CONTROL) => {
+                                    if let Some(ref mut s) = state {
+                                        s.push_char(ch);
+                                    }
+                                }
+                                (KeyCode::PageUp, _) => {
+                                    if let Some(ref mut s) = state {
+                                        s.scroll_up(10);
+                                    }
+                                }
+                                (KeyCode::PageDown, _) => {
+                                    if let Some(ref mut s) = state {
+                                        s.scroll_down(10);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        TuiEvent::Render => {
+                            if let (Some(t), Some(s)) = (tui.as_mut(), state.as_ref()) {
+                                t.draw(s).ok();
+                            }
+                        }
+                        TuiEvent::Resize(_, _) => {
+                            // ratatui handles resize automatically on next draw.
+                        }
+                    }
+                    continue;
+                }
+
+                // Fallback: line-buffered stdin for non-interactive mode.
+                result = async {
+                    match stdin_reader.as_mut() {
+                        Some(reader) => reader.next_line().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match result {
+                        Ok(Some(input)) if !input.trim().is_empty() => {
+                            let items = vec![UserInput::Text {
+                                text: input.clone(),
+                                text_elements: Vec::new(),
+                            }];
+                            match thread.steer_input(items, None).await {
+                                Ok(_) => emit(&mut state, &format!("  [steered: {}]", input), true),
+                                Err(_) => {
+                                    emit(&mut state, &format!("  [queued: {}]", input), true);
+                                    pending_input = Some(input);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            break 'outer;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+            };
 
             match &event.msg {
                 EventMsg::AgentMessage(msg) => {
@@ -315,25 +520,64 @@ pub async fn run(
                     // fallback so the message isn't printed twice.
                     if !msg.message.is_empty() {
                         if last_message.is_empty() {
-                            eprintln!("{}", msg.message);
+                            emit(&mut state, &msg.message, true);
                         }
                         last_message = msg.message.clone();
                     }
                 }
                 EventMsg::AgentMessageDelta(delta) => {
                     if !delta.delta.is_empty() {
-                        eprint!("{}", delta.delta);
-                        std::io::stderr().flush().ok();
+                        emit(&mut state, &delta.delta, false);
                         last_message.push_str(&delta.delta);
+                        if let Some(ref mut w) = event_writer {
+                            w.append_event(&SessionEvent::Message {
+                                content: delta.delta.clone(),
+                            })
+                            .ok();
+                        }
                     }
                 }
                 EventMsg::ExecCommandBegin(cmd) => {
-                    eprintln!("  $ {}", cmd.command.join(" "));
+                    emit(&mut state, &format!("  $ {}", cmd.command.join(" ")), true);
                 }
                 EventMsg::ExecCommandEnd(result) => {
                     if result.exit_code != 0 {
-                        eprintln!("  exit code {}", result.exit_code);
+                        emit(
+                            &mut state,
+                            &format!("  exit code {}", result.exit_code),
+                            true,
+                        );
                     }
+                    let cmd = result.command.join(" ");
+                    let dur = result.duration.as_millis() as u64;
+                    commands_log.push(CommandEntry {
+                        command: cmd.clone(),
+                        exit_code: result.exit_code,
+                        duration_ms: dur,
+                    });
+                    if let Some(ref mut w) = event_writer {
+                        w.append_event(&SessionEvent::Command {
+                            command: cmd,
+                            exit_code: result.exit_code,
+                            duration_ms: dur,
+                        })
+                        .ok();
+                    }
+                }
+                EventMsg::DynamicToolCallRequest(req) if req.tool == "session_history" => {
+                    let result_text = handle_session_history_tool(&req.arguments, &history_dir);
+                    thread
+                        .submit(Op::DynamicToolResponse {
+                            id: req.call_id.clone(),
+                            response: DynamicToolResponse {
+                                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                                    text: result_text,
+                                }],
+                                success: true,
+                            },
+                        })
+                        .await
+                        .ok();
                 }
                 EventMsg::DynamicToolCallRequest(req) if req.tool == "session_complete" => {
                     let summary = req
@@ -390,6 +634,17 @@ pub async fn run(
                 EventMsg::TokenCount(tc) => {
                     if let Some(ref info) = tc.info {
                         last_token_info = Some(info.clone());
+                        if let Some(ref mut w) = event_writer {
+                            let u = &info.total_token_usage;
+                            w.append_event(&SessionEvent::TokenCount {
+                                input_tokens: u.input_tokens,
+                                cached_input_tokens: u.cached_input_tokens,
+                                output_tokens: u.output_tokens,
+                                reasoning_output_tokens: u.reasoning_output_tokens,
+                                context_window: info.model_context_window,
+                            })
+                            .ok();
+                        }
                     }
                     if let Some(ref rl) = tc.rate_limits {
                         last_rate_limits = Some(rl.clone());
@@ -400,7 +655,7 @@ pub async fn run(
         }
 
         // Ensure a clean newline after streamed LLM output.
-        eprintln!();
+        emit(&mut state, "", true);
 
         // Save session results.
         duration_secs = session_start.elapsed().as_secs();
@@ -411,44 +666,37 @@ pub async fn run(
             completion_summary.clone()
         };
 
-        if *shutdown_rx.borrow() {
-            break;
-        }
-
         if session_completed {
             // Post-hook: execute the action the LLM chose.
             if let Some(ref wt) = worktree {
                 let result = match completion_action.as_str() {
                     "merge" => {
-                        let mut result = format!(
-                            "merged {} into {}",
-                            wt.branch, wt.base_branch
-                        );
+                        let mut result = format!("merged {} into {}", wt.branch, wt.base_branch);
                         let output = std::process::Command::new("git")
                             .args(["checkout", &wt.base_branch])
                             .current_dir(&cwd_for_check)
                             .output();
-                        if let Ok(o) = output {
-                            if o.status.success() {
-                                let merge = std::process::Command::new("git")
-                                    .args(["merge", "--ff-only", &wt.branch])
-                                    .current_dir(&cwd_for_check)
-                                    .output();
-                                match merge {
-                                    Ok(m) if !m.status.success() => {
-                                        result = format!(
-                                            "merge failed; branch {} available for manual merge",
-                                            wt.branch
-                                        );
-                                    }
-                                    Err(_) => {
-                                        result = format!(
-                                            "merge failed; branch {} available for manual merge",
-                                            wt.branch
-                                        );
-                                    }
-                                    _ => {}
+                        if let Ok(o) = output
+                            && o.status.success()
+                        {
+                            let merge = std::process::Command::new("git")
+                                .args(["merge", "--ff-only", &wt.branch])
+                                .current_dir(&cwd_for_check)
+                                .output();
+                            match merge {
+                                Ok(m) if !m.status.success() => {
+                                    result = format!(
+                                        "merge failed; branch {} available for manual merge",
+                                        wt.branch
+                                    );
                                 }
+                                Err(_) => {
+                                    result = format!(
+                                        "merge failed; branch {} available for manual merge",
+                                        wt.branch
+                                    );
+                                }
+                                _ => {}
                             }
                         }
                         result
@@ -472,30 +720,87 @@ pub async fn run(
             break;
         }
 
-        // Sleep between sessions, but wake on user input or ctrl-c.
+        // Sleep between sessions, wake on user input or ctrl-c.
         if config.sleep_secs > 0 {
-            eprintln!(
-                "\n  Sleeping {}s (type to wake)...",
-                config.sleep_secs
+            emit(
+                &mut state,
+                &format!("\nSleeping {}s (type to wake)...", config.sleep_secs),
+                true,
             );
+
+            // Update status bar during sleep.
+            if let Some(ref mut s) = state {
+                s.status = format!("{} | sleeping...", s.status);
+            }
 
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
-                line = stdin_reader.next_line() => {
-                    match line {
+
+                // TUI events during sleep.
+                Some(tui_event) = async {
+                    match tui.as_mut() {
+                        Some(t) => t.next_event().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match tui_event {
+                        TuiEvent::Key(key) => {
+                            match (key.code, key.modifiers) {
+                                (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                                    break 'outer;
+                                }
+                                (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
+                                    let empty = state.as_ref().is_none_or(|s| s.input_buf.is_empty());
+                                    if empty { break 'outer; }
+                                }
+                                (KeyCode::Enter, _) => {
+                                    if let Some(ref mut s) = state {
+                                        let text = s.take_input();
+                                        if !text.trim().is_empty() {
+                                            emit(&mut state, &format!("Received: {}", text), true);
+                                            pending_input = Some(text);
+                                        }
+                                    }
+                                }
+                                (KeyCode::Backspace, _) => {
+                                    if let Some(ref mut s) = state {
+                                        s.backspace();
+                                    }
+                                }
+                                (KeyCode::Char(ch), m) if !m.contains(KeyModifiers::CONTROL) => {
+                                    if let Some(ref mut s) = state {
+                                        s.push_char(ch);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        TuiEvent::Render => {
+                            if let (Some(t), Some(s)) = (tui.as_mut(), state.as_ref()) {
+                                t.draw(s).ok();
+                            }
+                        }
+                        TuiEvent::Resize(_, _) => {}
+                    }
+                }
+
+                // Fallback: line-buffered stdin for non-interactive mode.
+                result = async {
+                    match stdin_reader.as_mut() {
+                        Some(reader) => reader.next_line().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match result {
                         Ok(Some(input)) if !input.trim().is_empty() => {
-                            eprintln!("User input received, injecting into next session.");
-                            memory.set("user_input".into(), input);
-                            memory.save().ok();
+                            emit(&mut state, &format!("Received: {}", input), true);
+                            pending_input = Some(input);
                         }
                         Ok(None) => {
-                            eprintln!("stdin closed, continuing.");
+                            break 'outer;
                         }
                         _ => {}
                     }
-                }
-                _ = shutdown_rx.changed() => {
-                    break 'outer;
                 }
             }
         }
@@ -523,10 +828,34 @@ pub async fn run(
         response_summary: response_summary.clone(),
         action: worktree_result.clone(),
         tokens,
+        command_count: Some(commands_log.len()),
     };
-    history::save(&history_dir, &record).ok();
+    if let Some(writer) = event_writer.take() {
+        writer.finalize(&record).ok();
+    }
 
-    // Print summary.
+    // Restore the terminal before printing the summary so it appears in
+    // normal scrollback (visible after the alternate screen exits).
+    if let Some(ref mut t) = tui {
+        t.restore().ok();
+    }
+
+    // Replay session output to stderr so it's visible in scrollback after
+    // the alternate screen exits.
+    if let Some(ref s) = state {
+        for line in &s.output_lines {
+            eprintln!("{line}");
+        }
+        if !s.current_line.is_empty() {
+            eprintln!("{}", s.current_line);
+        }
+    }
+
+    // Drop the TUI and state so no further draws happen.
+    drop(tui);
+    drop(state);
+
+    // Print summary to plain stderr (alternate screen already exited).
     eprintln!("\n### Summary\n");
     eprintln!("Result:    {}", truncate_string(&response_summary, 200));
     if let Some(ref wt_result) = worktree_result {
@@ -590,6 +919,136 @@ pub async fn run(
     .await;
 
     Ok(())
+}
+
+/// Handle calls to the `session_history` dynamic tool.
+fn handle_session_history_tool(args: &serde_json::Value, history_dir: &std::path::Path) -> String {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("list");
+
+    match action {
+        "list" => {
+            let records = match history::list(history_dir) {
+                Ok(r) => r,
+                Err(e) => return format!("Error loading history: {e}"),
+            };
+            if records.is_empty() {
+                return "No previous sessions found.".into();
+            }
+            let mut out = String::from("Session | Date | Duration | Commands | Summary\n");
+            out.push_str("--------|------|----------|----------|--------\n");
+            for r in &records {
+                let date = r.started_at.format("%Y-%m-%d %H:%M");
+                let cmd_count = r.command_count.unwrap_or(0);
+                let summary = truncate_string(&r.response_summary, 80);
+                out.push_str(&format!(
+                    "{} | {} | {}s | {} | {}\n",
+                    r.session_number, date, r.duration_secs, cmd_count, summary,
+                ));
+            }
+            out.push_str(&format!(
+                "\n{} sessions total. Use action='view' with session_number to see details.",
+                records.len()
+            ));
+            out
+        }
+        "view" => {
+            let session_number = args
+                .get("session_number")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            if session_number == 0 {
+                return "session_number is required for the 'view' action.".into();
+            }
+
+            let records = match history::list(history_dir) {
+                Ok(r) => r,
+                Err(e) => return format!("Error loading history: {e}"),
+            };
+            let record = records.iter().find(|r| r.session_number == session_number);
+            let record = match record {
+                Some(r) => r,
+                None => return format!("Session {session_number} not found."),
+            };
+
+            let section = args
+                .get("section")
+                .and_then(|v| v.as_str())
+                .unwrap_or("all");
+            // offset = how many lines back from the end to start (0 = last page)
+            let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+
+            let mut lines: Vec<String> = Vec::new();
+
+            // Header (always at the top of content)
+            lines.push(format!("# Session {}", record.session_number));
+            lines.push(format!(
+                "Date: {} | Model: {} | Duration: {}s",
+                record.started_at.format("%Y-%m-%d %H:%M:%S"),
+                record.model,
+                record.duration_secs,
+            ));
+            lines.push(format!("Summary: {}", record.response_summary));
+            lines.push(String::new());
+
+            // Load events from events.jsonl (empty vec for legacy sessions).
+            let events = history::load_events(history_dir, &record.session_id).unwrap_or_default();
+
+            if section == "all" || section == "commands" {
+                lines.push("## Commands".into());
+                let cmds = history::extract_commands(&events);
+                if cmds.is_empty() {
+                    lines.push("(no commands executed)".into());
+                } else {
+                    for cmd in &cmds {
+                        let status = if cmd.exit_code == 0 {
+                            "ok".to_string()
+                        } else {
+                            format!("exit {}", cmd.exit_code)
+                        };
+                        lines.push(format!(
+                            "$ {} [{}] ({}ms)",
+                            cmd.command, status, cmd.duration_ms
+                        ));
+                    }
+                }
+                lines.push(String::new());
+            }
+
+            if section == "all" || section == "response" {
+                lines.push("## Full Response".into());
+                let response = history::reconstruct_response(&events);
+                if response.is_empty() {
+                    lines.push("(Full response not available for this session)".into());
+                } else {
+                    for line in response.lines() {
+                        lines.push(line.to_string());
+                    }
+                }
+            }
+
+            // Paginate from the end: offset=0 shows the last `limit` lines.
+            let total = lines.len();
+            let end = total.saturating_sub(offset);
+            let start = end.saturating_sub(limit);
+            let page: Vec<&str> = lines[start..end].iter().map(|s| s.as_str()).collect();
+
+            let mut out = page.join("\n");
+            out.push_str(&format!("\n\n[lines {}-{} of {}]", start + 1, end, total));
+            if start > 0 {
+                out.push_str(&format!(
+                    " Earlier content: offset={}, limit={}",
+                    offset + limit,
+                    limit
+                ));
+            }
+            out
+        }
+        _ => format!("Unknown action '{action}'. Use 'list' or 'view'."),
+    }
 }
 
 /// Return a truncated display string with an ellipsis when over max bytes.
