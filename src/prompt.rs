@@ -10,6 +10,10 @@ use crate::skills::{Skill, format_skills_section};
 ///
 /// `worktree_info` is `Some((branch, base_branch))` when the bot is running
 /// in an isolated git worktree.
+///
+/// `user_input` is text the user typed between sessions (during the sleep
+/// phase) that should be addressed directly this session.
+#[allow(clippy::too_many_arguments)]
 pub fn build_prompt(
     instructions: &str,
     skills: &[Skill],
@@ -19,6 +23,7 @@ pub fn build_prompt(
     bot_skill_dir: &Path,
     project_context: Option<&str>,
     worktree_info: Option<(&str, &str)>,
+    user_input: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
 
@@ -60,6 +65,16 @@ pub fn build_prompt(
         prompt.push('\n');
     }
 
+    // User input — the user typed this between sessions and it should be
+    // treated as a direct instruction to address in this session.
+    if let Some(input) = user_input {
+        prompt.push_str("## User Input\n\n");
+        prompt.push_str(
+            "The user provided the following input. Address this directly in your response:\n\n",
+        );
+        prompt.push_str(&format!("> {input}\n\n"));
+    }
+
     // Recent history section.
     if !recent_history.is_empty() {
         prompt.push_str("### Recent History\n");
@@ -82,12 +97,30 @@ pub fn build_prompt(
     prompt.push_str("- Work through the task independently and make as much progress as you can\n");
     prompt.push_str("- When you are done, call the `session_complete` tool with a summary of what you accomplished\n");
     prompt.push_str(
+        "- You can call the `session_history` tool to browse previous sessions in detail. \
+         Use action='list' for an overview or action='view' with session_number to read \
+         the full transcript and commands (shows the end first; increase offset to page backward).\n",
+    );
+    prompt.push_str(
         "- Do not stop and ask for clarification — use your best judgment and keep moving\n",
     );
+    // Skills documentation.
     prompt.push_str(&format!(
-        "- If you develop a reusable procedure, save it as a skill in `{}/` \
-         (markdown with `name:` and `description:` frontmatter). \
-         It will be available in the next session.\n",
+        "\n## Skills System\n\n\
+         Skills are reusable markdown workflows loaded into your prompt each session.\n\
+         You currently have {} skill(s) loaded (listed above under \"Available Skills\" if any).\n\n\
+         **Creating skills:** Write a markdown file to `{}/` with YAML frontmatter:\n\
+         ```\n\
+         ---\n\
+         name: skill-name\n\
+         description: What this skill does\n\
+         ---\n\
+         Step-by-step instructions, examples, and guidelines here.\n\
+         ```\n\
+         The skill will be loaded automatically in your next session.\n\n\
+         **When to create a skill:** If you develop a reusable procedure, debugging technique,\n\
+         or workflow pattern that would be useful across sessions, save it as a skill.\n",
+        skills.len(),
         bot_skill_dir.display()
     ));
 
