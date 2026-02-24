@@ -11,6 +11,7 @@ mod prompt;
 mod registry;
 mod runner;
 mod skills;
+mod tui;
 mod workspace;
 
 use anyhow::Result;
@@ -341,10 +342,7 @@ async fn main() -> Result<()> {
                 } else {
                     println!("Skills for '{bot}' ({}):\n", skills.len());
                     for skill in &skills {
-                        let origin = skill
-                            .source
-                            .as_deref()
-                            .unwrap_or("local");
+                        let origin = skill.source.as_deref().unwrap_or("local");
                         println!("  {} - {} ({})", skill.name, skill.description, origin);
                     }
                 }
@@ -360,19 +358,11 @@ async fn main() -> Result<()> {
                         results.count,
                         if results.count == 1 { "" } else { "s" }
                     );
-                    let max_id = results
-                        .skills
-                        .iter()
-                        .map(|s| s.id.len())
-                        .max()
-                        .unwrap_or(5);
+                    let max_id = results.skills.iter().map(|s| s.id.len()).max().unwrap_or(5);
                     println!("  {:<max_id$}   {:>10}", "Skill", "Installs");
                     println!("  {:<max_id$}   {:>10}", "─".repeat(max_id), "─".repeat(10));
                     for skill in &results.skills {
-                        println!(
-                            "  {:<max_id$}   {:>10}",
-                            skill.id, skill.installs,
-                        );
+                        println!("  {:<max_id$}   {:>10}", skill.id, skill.installs,);
                     }
                     println!("\nInstall: openbot skills install <id> [--bot <name> | --global]");
                 }
@@ -440,6 +430,31 @@ async fn main() -> Result<()> {
                             "{}",
                             serde_json::to_string_pretty(&record).unwrap_or_default()
                         );
+
+                        // Show events from events.jsonl if available.
+                        let events = history::load_events(&history_dir, id).unwrap_or_default();
+                        if !events.is_empty() {
+                            let cmds = history::extract_commands(&events);
+                            if !cmds.is_empty() {
+                                println!("\nCommands ({}):", cmds.len());
+                                for cmd in &cmds {
+                                    let status = if cmd.exit_code == 0 {
+                                        "ok".to_string()
+                                    } else {
+                                        format!("exit {}", cmd.exit_code)
+                                    };
+                                    println!(
+                                        "  $ {} [{}] ({}ms)",
+                                        cmd.command, status, cmd.duration_ms
+                                    );
+                                }
+                            }
+
+                            let response = history::reconstruct_response(&events);
+                            if !response.is_empty() {
+                                println!("\nResponse:\n{}", response);
+                            }
+                        }
                     }
                     Err(e) => {
                         println!("Session {id} not found: {e}");
@@ -453,19 +468,18 @@ async fn main() -> Result<()> {
                 } else {
                     for record in &records {
                         let duration = if record.duration_secs >= 60 {
-                            format!("{}m{}s", record.duration_secs / 60, record.duration_secs % 60)
+                            format!(
+                                "{}m{}s",
+                                record.duration_secs / 60,
+                                record.duration_secs % 60
+                            )
                         } else {
                             format!("{}s", record.duration_secs)
                         };
                         let tokens = record
                             .tokens
                             .as_ref()
-                            .map(|t| {
-                                format!(
-                                    "{} in / {} out",
-                                    t.input_tokens, t.output_tokens
-                                )
-                            })
+                            .map(|t| format!("{} in / {} out", t.input_tokens, t.output_tokens))
                             .unwrap_or_default();
                         let action = record.action.as_deref().unwrap_or("-");
                         println!(

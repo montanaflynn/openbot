@@ -40,18 +40,13 @@ pub fn bot_workspace_memory_path(name: &str, slug: &str) -> Result<PathBuf> {
 
 /// Per-project history directory (`~/.openbot/bots/<name>/workspaces/<slug>/history/`).
 pub fn bot_workspace_history_dir(name: &str, slug: &str) -> Result<PathBuf> {
-    Ok(bot_dir(name)?
-        .join("workspaces")
-        .join(slug)
-        .join("history"))
+    Ok(bot_dir(name)?.join("workspaces").join(slug).join("history"))
 }
 
 /// Bot config path (`~/.openbot/bots/<name>/config.md`).
 pub fn bot_config_path(name: &str) -> Result<PathBuf> {
     Ok(bot_dir(name)?.join("config.md"))
 }
-
-
 
 /// Ensure the bot directory structure exists.
 pub fn ensure_bot_dirs(name: &str) -> Result<()> {
@@ -75,10 +70,10 @@ pub fn list_bots() -> Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(bots_dir)? {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
+        if entry.file_type()?.is_dir()
+            && let Some(name) = entry.file_name().to_str()
+        {
+            names.push(name.to_string());
         }
     }
     names.sort();
@@ -182,10 +177,10 @@ pub fn serialize_config_md(config: &BotConfig) -> String {
     if config.sleep_secs != defaults.sleep_secs {
         fm.push_str(&format!("sleep_secs = {}\n", config.sleep_secs));
     }
-    if config.stop_phrase != defaults.stop_phrase {
-        if let Some(ref phrase) = config.stop_phrase {
-            fm.push_str(&format!("stop_phrase = {:?}\n", phrase));
-        }
+    if config.stop_phrase != defaults.stop_phrase
+        && let Some(ref phrase) = config.stop_phrase
+    {
+        fm.push_str(&format!("stop_phrase = {:?}\n", phrase));
     }
     if let Some(ref model) = config.model {
         fm.push_str(&format!("model = {:?}\n", model));
