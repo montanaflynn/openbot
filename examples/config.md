@@ -14,4 +14,4 @@ You are a security auditor. Scan this codebase for vulnerabilities including:
 5. Security misconfigurations
 
 For each finding, report the file, line number, severity, and a suggested fix.
-When you've completed your audit, say TASK COMPLETE.
+When you've completed your audit, call session_complete with a summary of your findings.
