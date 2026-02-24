@@ -9,8 +9,8 @@ This document explains the runtime architecture of `openbot` and how modules int
 1. Loads the bot's configuration, skills (global + local), and memory.
 2. Builds a prompt for the current iteration.
 3. Submits a `UserTurn` to Codex.
-4. Streams events/results.
-5. Persists a summarized history record.
+4. Streams events to disk (`events.jsonl`) as they arrive.
+5. Finalizes session metadata (`metadata.json`) on completion.
 6. Repeats until completion criteria are met.
 
 ## Directory Layout
@@ -22,9 +22,13 @@ This document explains the runtime architecture of `openbot` and how modules int
     └── <name>/
         ├── config.md          # Bot config (TOML frontmatter + markdown body)
         ├── skills/            # Bot-local skills
-        └── workspaces/        # Per-project memory
+        └── workspaces/        # Per-project data
             └── <slug>/        # Slug derived from directory name
-                └── memory.json
+                ├── memory.json
+                └── history/
+                    └── <session_id>/
+                        ├── metadata.json   # Session-level summary
+                        └── events.jsonl    # Append-only event stream
 ```
 
 ## Module Map
@@ -51,20 +55,27 @@ This document explains the runtime architecture of `openbot` and how modules int
   - Formats a prompt section containing loaded skills.
 
 - `src/memory.rs`
-  - Defines persistent memory model (`entries`, `history`).
+  - Defines persistent memory model (key-value `entries`).
   - Handles JSON load/save (per-workspace at `~/.openbot/bots/<name>/workspaces/<slug>/memory.json`).
   - Provides CLI-friendly rendering for `openbot memory <bot> show`.
 
 - `src/prompt.rs`
-  - Assembles iteration prompt from instructions, skills, memory, and meta instructions.
-  - Includes iteration count, urgency warnings, and worktree branch context.
+  - Assembles iteration prompt from instructions, skills, memory, and recent session history.
+  - Includes session count, worktree branch context, and tool usage instructions.
   - Tells the agent where to save new skills.
+
+- `src/history.rs`
+  - Defines `SessionRecord` (metadata), `SessionEvent` (event stream), and `SessionWriter`.
+  - `SessionWriter` creates a directory per session, writes `metadata.json` and streams events to `events.jsonl`.
+  - Reader functions support both new directory format and legacy `.json` files.
+  - Helpers: `load_events()`, `reconstruct_response()`, `extract_commands()`.
 
 - `src/runner.rs`
   - Orchestrates the main agent loop.
   - Creates a git worktree for isolation (default) or runs in the working tree (`--no-worktree`).
   - Starts or resumes a Codex session/thread.
-  - Submits turns, consumes event stream, persists iteration summaries, and handles sleep/wake behavior.
+  - Creates a `SessionWriter` at session start and streams events to disk as they happen.
+  - Submits turns, consumes event stream, and handles sleep/wake behavior.
   - Handles graceful ctrl-c shutdown and prints resume hint.
 
 - `src/workspace.rs`
@@ -79,22 +90,25 @@ This document explains the runtime architecture of `openbot` and how modules int
 4. For each iteration:
    - Skills are reloaded (picks up newly created skills).
    - `prompt::build_prompt` returns the full prompt.
+   - A `SessionWriter` is created, writing initial `metadata.json` and opening `events.jsonl`.
    - Prompt is submitted as `Op::UserTurn`.
-   - Event stream is consumed until `TurnComplete` or `TurnAborted`.
-   - Last response is summarized and saved via `MemoryStore`.
-5. Loop exits on stop phrase, iteration limit, or ctrl-c.
+   - Event stream is consumed until `TurnComplete` or `TurnAborted`; events are streamed to `events.jsonl` as they arrive.
+   - On completion, `SessionWriter::finalize()` overwrites `metadata.json` with final summary.
+5. Loop exits on `session_complete` tool call, iteration limit, or ctrl-c.
 6. Runner sends `Op::Shutdown` with a 5-second timeout.
 7. Worktree directory is removed (branch is kept).
 8. Resume hint is printed with the session ID.
 
 ## Event Handling
 
-`runner` handles these event types:
+`runner` handles these event types from Codex and streams them to `events.jsonl`:
 
-- `AgentMessage`: full message snapshots
-- `AgentMessageDelta`: streaming partial output
-- `ExecCommandBegin` / `ExecCommandEnd`: command lifecycle logging
+- `AgentMessage`: full message snapshots (fallback when no deltas received)
+- `AgentMessageDelta`: streaming partial output → `SessionEvent::Message`
+- `ExecCommandBegin` / `ExecCommandEnd`: command lifecycle → `SessionEvent::Command`
+- `TokenCount`: token usage snapshots → `SessionEvent::TokenCount`
 - `ExecApprovalRequest`: auto-approved in autonomous mode
+- `DynamicToolCallRequest`: handles `session_complete` and `session_history` tools
 - `TurnComplete`: marks end of a turn
 - `TurnAborted`: turn interrupted (e.g. ctrl-c)
 - `Error`: logs and ends current turn processing
@@ -113,9 +127,9 @@ Other events are ignored.
 Each prompt includes:
 
 - Base instructions from bot config.
-- Current iteration marker with remaining count.
-- Worktree branch name and integration instructions (when running in a worktree).
-- Skills section (if any).
-- Memory entries and last 5 history items.
-- Standard completion instructions including the `TASK COMPLETE` convention.
+- Status block: project name, session number, worktree branch context.
+- Skills section (if any loaded from global + bot-local directories).
+- Memory entries (agent's key-value store).
+- Last 5 session history summaries for continuity.
+- Instructions for using the `session_complete` and `session_history` tools.
 - Skill creation hint pointing to the bot's skill directory.
