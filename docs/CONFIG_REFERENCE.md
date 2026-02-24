@@ -41,7 +41,7 @@ If no frontmatter is present, the entire file is treated as instructions.
   - Default: `30`.
 
 - `stop_phrase` (`string` or omitted)
-  - If the final agent message contains this phrase, loop exits early.
+  - Legacy field, currently unused. Session completion is handled by the `session_complete` dynamic tool.
   - Default: `"TASK COMPLETE"`.
 
 - `model` (`string` or omitted)
