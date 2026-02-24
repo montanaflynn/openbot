@@ -23,7 +23,9 @@ pub struct RegistrySkill {
 /// Response from `GET https://skills.sh/api/search`.
 #[derive(Debug, Deserialize)]
 pub struct SearchResponse {
+    /// Skills returned in the current page of search results.
     pub skills: Vec<RegistrySkill>,
+    /// Total number of matches reported by the API.
     pub count: u64,
 }
 
@@ -60,9 +62,8 @@ pub async fn fetch_skill_md(source: &str, skill_id: &str) -> Result<String> {
     let client = reqwest::Client::new();
 
     // Try multi-skill layout first.
-    let multi_url = format!(
-        "https://raw.githubusercontent.com/{source}/main/skills/{skill_id}/SKILL.md"
-    );
+    let multi_url =
+        format!("https://raw.githubusercontent.com/{source}/main/skills/{skill_id}/SKILL.md");
 
     let resp = client
         .get(&multi_url)
@@ -75,9 +76,7 @@ pub async fn fetch_skill_md(source: &str, skill_id: &str) -> Result<String> {
     }
 
     // Fallback: single-skill repo.
-    let single_url = format!(
-        "https://raw.githubusercontent.com/{source}/main/SKILL.md"
-    );
+    let single_url = format!("https://raw.githubusercontent.com/{source}/main/SKILL.md");
 
     let resp = client
         .get(&single_url)
@@ -94,7 +93,7 @@ pub async fn fetch_skill_md(source: &str, skill_id: &str) -> Result<String> {
     )
 }
 
-/// Minimal percent-encoding for query parameters.
+/// Encode a subset of reserved characters for a query parameter value.
 fn urlencoded(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {

@@ -1,11 +1,16 @@
+//! Git helpers for discovering repo roots and managing temporary worktrees.
+
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Information about a created worktree.
 pub struct WorktreeInfo {
+    /// Filesystem path to the created worktree directory.
     pub path: PathBuf,
+    /// Name of the branch created for the run.
     pub branch: String,
+    /// Branch that the new worktree branch was based on.
     pub base_branch: String,
 }
 
@@ -91,6 +96,7 @@ pub struct WorktreeGuard {
 }
 
 impl WorktreeGuard {
+    /// Create a guard that removes the worktree path when dropped.
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }

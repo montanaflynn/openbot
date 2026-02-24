@@ -24,7 +24,13 @@ pub fn slug_from_path(path: &Path) -> String {
     let slug: String = name
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
 
     // Trim leading/trailing hyphens and collapse runs.
@@ -51,8 +57,14 @@ mod tests {
 
     #[test]
     fn slug_from_typical_path() {
-        assert_eq!(slug_from_path(Path::new("/home/user/my-project")), "my-project");
+        assert_eq!(
+            slug_from_path(Path::new("/home/user/my-project")),
+            "my-project"
+        );
         assert_eq!(slug_from_path(Path::new("/home/user/MyApp")), "myapp");
-        assert_eq!(slug_from_path(Path::new("/home/user/backend_api")), "backend-api");
+        assert_eq!(
+            slug_from_path(Path::new("/home/user/backend_api")),
+            "backend-api"
+        );
     }
 }

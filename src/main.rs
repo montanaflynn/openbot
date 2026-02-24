@@ -1,3 +1,8 @@
+//! CLI entrypoint and command routing for openbot.
+//!
+//! This module defines all top-level subcommands and delegates each action
+//! to the corresponding runtime/helper module.
+
 mod config;
 mod git;
 mod memory;
@@ -11,6 +16,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
+/// Top-level CLI arguments parsed by clap.
 #[command(name = "openbot", about = "AI agent loop powered by codex-core")]
 struct Cli {
     #[command(subcommand)]
@@ -18,6 +24,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+/// First-level CLI commands.
 enum Commands {
     /// Run a bot
     Run {
@@ -81,6 +88,7 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+/// openbot bots subcommands.
 enum BotsAction {
     /// List all bots
     List,
@@ -103,6 +111,7 @@ enum BotsAction {
 }
 
 #[derive(Subcommand)]
+/// openbot skills subcommands.
 enum SkillsAction {
     /// List skills for a bot
     List {
@@ -142,6 +151,7 @@ enum SkillsAction {
 }
 
 #[derive(Subcommand)]
+/// openbot memory subcommands.
 enum MemoryAction {
     /// Show all memory entries and history
     Show,
@@ -219,19 +229,31 @@ async fn main() -> Result<()> {
                         if cfg.description.is_empty() {
                             println!(
                                 "  {name}  ({skill_count} skills, {})",
-                                if has_memory { "has memory" } else { "no memory" }
+                                if has_memory {
+                                    "has memory"
+                                } else {
+                                    "no memory"
+                                }
                             );
                         } else {
                             println!(
                                 "  {name} - {}  ({skill_count} skills, {})",
                                 cfg.description,
-                                if has_memory { "has memory" } else { "no memory" }
+                                if has_memory {
+                                    "has memory"
+                                } else {
+                                    "no memory"
+                                }
                             );
                         }
                     }
                 }
             }
-            BotsAction::Create { name, description, prompt } => {
+            BotsAction::Create {
+                name,
+                description,
+                prompt,
+            } => {
                 config::ensure_global_dirs()?;
                 config::ensure_bot_dirs(&name)?;
 
@@ -322,10 +344,7 @@ async fn main() -> Result<()> {
                     );
                     for skill in &results.skills {
                         println!("  {} - {}", skill.id, skill.name);
-                        println!(
-                            "    source: {}  installs: {}",
-                            skill.source, skill.installs
-                        );
+                        println!("    source: {}  installs: {}", skill.source, skill.installs);
                     }
                     println!("\nInstall with: openbot skills install <id> --global");
                 }
@@ -391,7 +410,11 @@ async fn main() -> Result<()> {
             }
         },
 
-        Commands::Memory { bot, project, action } => {
+        Commands::Memory {
+            bot,
+            project,
+            action,
+        } => {
             let mem_path = if let Some(ref slug) = project {
                 config::bot_workspace_memory_path(&bot, slug)?
             } else {
@@ -436,19 +459,14 @@ async fn main() -> Result<()> {
 fn parse_skill_identifier(id: &str) -> Result<(String, String)> {
     let parts: Vec<&str> = id.splitn(3, '/').collect();
     if parts.len() != 3 {
-        anyhow::bail!(
-            "invalid skill identifier '{id}': expected format owner/repo/skill-name"
-        );
+        anyhow::bail!("invalid skill identifier '{id}': expected format owner/repo/skill-name");
     }
     let source = format!("{}/{}", parts[0], parts[1]);
     let skill_id = parts[2].to_string();
     Ok((source, skill_id))
 }
 
+/// Return `s` unchanged when short enough, otherwise truncate to `max` bytes.
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        &s[..max]
-    }
+    if s.len() <= max { s } else { &s[..max] }
 }

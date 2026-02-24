@@ -1,3 +1,5 @@
+//! Prompt construction utilities used to build each autonomous session input.
+
 use std::path::Path;
 
 use crate::memory::MemoryStore;
@@ -80,11 +82,15 @@ pub fn build_prompt(
 
     // Instructions.
     prompt.push_str("## Instructions\n");
-    prompt.push_str("You are a fully autonomous agent. Do not ask for human input — make decisions and act.\n");
+    prompt.push_str(
+        "You are a fully autonomous agent. Do not ask for human input — make decisions and act.\n",
+    );
     prompt.push_str("Your goal is to ship working code: make changes, test them, and commit.\n\n");
     prompt.push_str("- Work through the task independently and make as much progress as you can\n");
     prompt.push_str("- When you are done, call the `session_complete` tool with a summary of what you accomplished\n");
-    prompt.push_str("- Do not stop and ask for clarification — use your best judgment and keep moving\n");
+    prompt.push_str(
+        "- Do not stop and ask for clarification — use your best judgment and keep moving\n",
+    );
     prompt.push_str(&format!(
         "- If you develop a reusable procedure, save it as a skill in `{}/` \
          (markdown with `name:` and `description:` frontmatter). \
@@ -95,10 +101,7 @@ pub fn build_prompt(
     prompt
 }
 
+/// Return a borrowed slice capped at max bytes for prompt summaries.
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        &s[..max]
-    }
+    if s.len() <= max { s } else { &s[..max] }
 }

@@ -1,11 +1,12 @@
+//! Configuration loading, defaults, and path helpers for bots and global data.
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
 /// The openbot home directory (`~/.openbot`).
 pub fn openbot_home() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| anyhow::anyhow!("$HOME not set"))?;
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("$HOME not set"))?;
     Ok(PathBuf::from(home).join(".openbot"))
 }
 
@@ -31,7 +32,10 @@ pub fn bot_memory_path(name: &str) -> Result<PathBuf> {
 
 /// Per-project memory path (`~/.openbot/bots/<name>/workspaces/<slug>/memory.json`).
 pub fn bot_workspace_memory_path(name: &str, slug: &str) -> Result<PathBuf> {
-    Ok(bot_dir(name)?.join("workspaces").join(slug).join("memory.json"))
+    Ok(bot_dir(name)?
+        .join("workspaces")
+        .join(slug)
+        .join("memory.json"))
 }
 
 /// Bot config path (`~/.openbot/bots/<name>/config.md`).
@@ -144,7 +148,8 @@ fn parse_config_md(contents: &str) -> Result<(Frontmatter, String)> {
     // Find the closing +++.
     let after_open = &trimmed[3..];
     let after_open = after_open.strip_prefix('\n').unwrap_or(after_open);
-    let close = after_open.find("\n+++")
+    let close = after_open
+        .find("\n+++")
         .ok_or_else(|| anyhow::anyhow!("config.md: missing closing +++"))?;
 
     let frontmatter_str = &after_open[..close];
@@ -155,8 +160,8 @@ fn parse_config_md(contents: &str) -> Result<(Frontmatter, String)> {
         String::new()
     };
 
-    let frontmatter: Frontmatter = toml::from_str(frontmatter_str)
-        .with_context(|| "parsing config.md frontmatter")?;
+    let frontmatter: Frontmatter =
+        toml::from_str(frontmatter_str).with_context(|| "parsing config.md frontmatter")?;
 
     Ok((frontmatter, body))
 }
@@ -210,7 +215,11 @@ impl BotConfig {
             let defaults = Self::default();
             Ok(Self {
                 description: fm.description.unwrap_or_default(),
-                instructions: if body.is_empty() { defaults.instructions } else { body },
+                instructions: if body.is_empty() {
+                    defaults.instructions
+                } else {
+                    body
+                },
                 max_iterations: fm.max_iterations.unwrap_or(defaults.max_iterations),
                 sleep_secs: fm.sleep_secs.unwrap_or(defaults.sleep_secs),
                 stop_phrase: fm.stop_phrase.or(defaults.stop_phrase),
@@ -261,10 +270,7 @@ impl BotConfig {
 
     /// Return skill directories for this bot: global + bot-local.
     pub fn skill_dirs(bot_name: &str) -> Result<Vec<PathBuf>> {
-        Ok(vec![
-            global_skills_dir()?,
-            bot_skills_dir(bot_name)?,
-        ])
+        Ok(vec![global_skills_dir()?, bot_skills_dir(bot_name)?])
     }
 
     /// Return the memory path for this bot.

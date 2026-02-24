@@ -151,6 +151,7 @@ pub struct InstalledSkill {
 /// Manifest tracking all registry-installed skills in a given scope.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkillManifest {
+    /// Map of short skill id to installation metadata.
     pub skills: BTreeMap<String, InstalledSkill>,
 }
 
@@ -185,8 +186,7 @@ pub fn install_skill(
     std::fs::create_dir_all(skill_dir)?;
 
     let md_path = skill_dir.join(format!("{skill_id}.md"));
-    std::fs::write(&md_path, content)
-        .with_context(|| format!("writing {}", md_path.display()))?;
+    std::fs::write(&md_path, content).with_context(|| format!("writing {}", md_path.display()))?;
 
     let mut manifest = load_manifest(manifest_path)?;
     manifest.skills.insert(

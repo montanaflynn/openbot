@@ -1,7 +1,9 @@
+//! Runtime loop that orchestrates codex sessions, memory persistence, and
+//! optional worktree isolation for autonomous bot runs.
+
 use anyhow::{Context, Result};
 use codex_core::config::{ConfigBuilder, ConfigOverrides, find_codex_home};
 use codex_core::{AuthManager, ThreadManager};
-use codex_protocol::config_types::SandboxMode;
 use codex_protocol::dynamic_tools::{
     DynamicToolCallOutputContentItem, DynamicToolResponse, DynamicToolSpec,
 };
@@ -63,10 +65,8 @@ pub async fn run(
     let _codex_home = find_codex_home().with_context(|| "finding codex home")?;
 
     let sandbox_mode = config.sandbox_mode();
-    let approval_policy = match sandbox_mode {
-        SandboxMode::DangerFullAccess => Some(AskForApproval::Never),
-        _ => Some(AskForApproval::Never),
-    };
+    // openbot sessions are unattended, so command approvals are always auto-approved.
+    let approval_policy = Some(AskForApproval::Never);
 
     // Resolve repo root and create worktree before building codex config so we
     // can point codex at the worktree's cwd.
@@ -79,8 +79,8 @@ pub async fn run(
 
     let worktree: Option<WorktreeInfo> = if !no_worktree {
         if let Some(ref root) = repo_root {
-            let wt = git::create_worktree(root, bot_name)
-                .with_context(|| "creating git worktree")?;
+            let wt =
+                git::create_worktree(root, bot_name).with_context(|| "creating git worktree")?;
             eprintln!("Worktree: {} (branch: {})", wt.path.display(), wt.branch);
             Some(wt)
         } else {
@@ -173,11 +173,7 @@ pub async fn run(
             Some(path) => {
                 eprintln!("Resuming session {session_id}...");
                 thread_manager
-                    .resume_thread_from_rollout(
-                        codex_config.clone(),
-                        path,
-                        auth_manager.clone(),
-                    )
+                    .resume_thread_from_rollout(codex_config.clone(), path, auth_manager.clone())
                     .await
                     .with_context(|| "resuming session")?
             }
@@ -197,7 +193,10 @@ pub async fn run(
     };
 
     let session_id = session_configured.session_id.to_string();
-    eprintln!("Session {} (model: {})", &session_id, &session_configured.model);
+    eprintln!(
+        "Session {} (model: {})",
+        &session_id, &session_configured.model
+    );
 
     // Set up ctrl-c handler for graceful shutdown.
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -450,6 +449,7 @@ pub async fn run(
     Ok(())
 }
 
+/// Return a truncated display string with an ellipsis when over max bytes.
 fn truncate_string(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
